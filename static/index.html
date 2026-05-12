@@ -257,6 +257,112 @@
     }
     /* Bottleneck bar highlight */
     .m-bar.bottleneck-bar { background: #f97316; }
+
+    /* === Video Swap Panel === */
+    .video-swap-panel {
+      margin-top: 16px;
+      width: 100%;
+      max-width: 860px;
+      background: #0f0f1a;
+      border: 1px solid #2a2a40;
+      border-radius: 10px;
+      padding: 18px 20px;
+    }
+    .video-swap-title {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: #888;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 14px;
+    }
+    .video-row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .video-upload-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      background: #1e1e2e;
+      border: 1px solid #3a3a54;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.88rem;
+      color: #ccc;
+      transition: background 0.2s;
+    }
+    .video-upload-btn:hover { background: #2a2a3e; }
+    #videoFileInput { display: none; }
+    #processVideoBtn {
+      padding: 8px 18px;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.88rem;
+      font-weight: 500;
+      cursor: pointer;
+      background: #7c6af7;
+      color: #fff;
+      transition: background 0.2s;
+    }
+    #processVideoBtn:hover:not(:disabled) { background: #6455d6; }
+    #processVideoBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    #cancelVideoBtn {
+      padding: 8px 16px;
+      background: #9b2335;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      transition: background .15s;
+    }
+    #cancelVideoBtn:hover { background: #c0392b; }
+    #cancelVideoBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .video-filename {
+      font-size: 0.8rem;
+      color: #666;
+      font-family: monospace;
+    }
+    .progress-wrap {
+      background: #1a1a2e;
+      border-radius: 6px;
+      height: 10px;
+      overflow: hidden;
+      width: 100%;
+      margin-bottom: 8px;
+    }
+    .progress-bar {
+      height: 100%;
+      border-radius: 6px;
+      background: linear-gradient(90deg, #7c6af7, #a78bfa);
+      transition: width 0.4s ease;
+      width: 0%;
+    }
+    .video-status-text {
+      font-size: 0.78rem;
+      color: #888;
+      font-family: monospace;
+    }
+    #downloadBtn {
+      padding: 8px 18px;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.88rem;
+      font-weight: 500;
+      cursor: pointer;
+      background: #1a3a1a;
+      color: #4ade80;
+      border: 1px solid #2a5a2a;
+      display: none;
+    }
+    #downloadBtn:hover { background: #2a4a2a; }
   </style>
 </head>
 <body>
@@ -349,6 +455,27 @@
 
   <!-- Hidden canvas dùng để capture webcam frame -->
   <canvas id="captureCanvas" style="display:none;"></canvas>
+
+  <!-- ===== Video Swap Panel ===== -->
+  <div class="video-swap-panel">
+    <div class="video-swap-title">🎬 Video Face Swap (Batch)</div>
+    <div class="video-row">
+      <label class="video-upload-btn" for="videoFileInput">
+        📂 Chọn file MP4
+      </label>
+      <input type="file" id="videoFileInput" accept="video/mp4,video/quicktime" />
+      <span class="video-filename" id="videoFilename">Chưa chọn file</span>
+      <button id="processVideoBtn" disabled>⚙ Xử lý Video</button>
+      <button id="cancelVideoBtn" style="display:none;">⛔ Dừng</button>
+    </div>
+    <div class="progress-wrap" id="progressWrap" style="display:none;">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div class="video-status-text" id="videoStatusText"></div>
+    <div style="margin-top:10px;">
+      <button id="downloadBtn">⬇ Tải video đã swap</button>
+    </div>
+  </div>
 
   <script>
     // ========================================================
@@ -492,6 +619,8 @@
           log(data.message, "ok");
           setStatus("Source face ready", "ready");
           startBtn.disabled = false;
+          // Enable video process button nếu đã chọn file video
+          if (selectedVideoFile) processVideoBtn.disabled = false;
 
           // Preview ảnh source face nhỏ
           const imgUrl = URL.createObjectURL(file);
@@ -672,6 +801,142 @@
     // ========================================================
     startBtn.disabled = true; // cần upload source trước mới enable
     log("Server sẵn sàng. Hãy upload source face rồi bắt đầu swap.", "info");
+
+    // ========================================================
+    //  Video Face Swap — Batch Processing
+    // ========================================================
+    const videoFileInput   = document.getElementById("videoFileInput");
+    const videoFilename    = document.getElementById("videoFilename");
+    const processVideoBtn  = document.getElementById("processVideoBtn");
+    const progressWrap     = document.getElementById("progressWrap");
+    const progressBar      = document.getElementById("progressBar");
+    const videoStatusText  = document.getElementById("videoStatusText");
+    const downloadBtn      = document.getElementById("downloadBtn");
+    const cancelVideoBtn   = document.getElementById("cancelVideoBtn");
+
+    let videoJobId      = null;
+    let videoPollTimer  = null;
+    let selectedVideoFile = null;
+
+    // Hiện tên file khi chọn
+    videoFileInput.addEventListener("change", (e) => {
+      selectedVideoFile = e.target.files[0];
+      if (!selectedVideoFile) return;
+      videoFilename.textContent = `${selectedVideoFile.name} (${(selectedVideoFile.size / 1024 / 1024).toFixed(1)} MB)`;
+      processVideoBtn.disabled = !state.sourceLoaded;
+      downloadBtn.style.display = "none";
+      progressWrap.style.display = "none";
+      videoStatusText.textContent = "";
+      videoJobId = null;
+    });
+
+    // Enable nút khi source face được load
+    // Patch vào sau upload-source thành công
+    const _origUploadChange = fileInput.onchange;
+    document.addEventListener("source-face-loaded", () => {
+      if (selectedVideoFile) processVideoBtn.disabled = false;
+    });
+
+    // Bắt đầu xử lý video
+    processVideoBtn.addEventListener("click", async () => {
+      if (!selectedVideoFile) return;
+      if (!state.sourceLoaded) {
+        log("Hãy upload source face trước.", "warn");
+        return;
+      }
+
+      processVideoBtn.disabled = true;
+      downloadBtn.style.display = "none";
+      progressWrap.style.display = "block";
+      progressBar.style.width = "0%";
+      videoStatusText.textContent = "Đang upload video...";
+      cancelVideoBtn.style.display = "none";
+      cancelVideoBtn.textContent = "⛔ Dừng";
+      cancelVideoBtn.disabled = false;
+
+      const formData = new FormData();
+      formData.append("file", selectedVideoFile);
+
+      try {
+        const res = await fetch("/upload-video", { method: "POST", body: formData });
+        const data = await res.json();
+        if (!res.ok) {
+          videoStatusText.textContent = `Lỗi: ${data.detail}`;
+          processVideoBtn.disabled = false;
+          return;
+        }
+        videoJobId = data.job_id;
+        videoStatusText.textContent = "Đang xử lý...";
+        cancelVideoBtn.style.display = "inline-block";
+        cancelVideoBtn.disabled = false;
+        // Bắt đầu poll tiến độ mỗi 2s
+        videoPollTimer = setInterval(pollVideoJob, 2000);
+      } catch (err) {
+        videoStatusText.textContent = `Lỗi kết nối: ${err.message}`;
+        processVideoBtn.disabled = false;
+      }
+    });
+
+    cancelVideoBtn.addEventListener("click", async () => {
+      if (!videoJobId) return;
+      cancelVideoBtn.disabled = true;
+      cancelVideoBtn.textContent = "Đang dừng...";
+      try {
+        await fetch(`/cancel-video/${videoJobId}`, { method: "POST" });
+      } catch {}
+    });
+
+    async function pollVideoJob() {
+      if (!videoJobId) return;
+      try {
+        const res  = await fetch(`/video-status/${videoJobId}`);
+        const data = await res.json();
+
+        const pct = data.progress_pct || 0;
+        progressBar.style.width = pct + "%";
+
+        if (data.status === "processing" || data.status === "queued") {
+          const label = data.frames_total > 0
+            ? `Đang xử lý... ${data.frames_done}/${data.frames_total} frames (${pct}%)`
+            : "Đang xử lý...";
+          videoStatusText.textContent = label;
+
+        } else if (data.status === "done") {
+          clearInterval(videoPollTimer);
+          progressBar.style.width = "100%";
+          videoStatusText.textContent = `✅ Hoàn thành! ${data.frames_total} frames đã swap.`;
+          downloadBtn.style.display = "inline-block";
+          downloadBtn.onclick = () => {
+            window.location.href = `/download/${videoJobId}`;
+          };
+          cancelVideoBtn.style.display = "none";
+          processVideoBtn.disabled = false;
+
+        } else if (data.status === "cancelling") {
+          videoStatusText.textContent = "Đang dừng...";
+
+        } else if (data.status === "cancelled") {
+          clearInterval(videoPollTimer);
+          progressBar.style.width = "0%";
+          videoStatusText.textContent = "⛔ Đã dừng xử lý.";
+          cancelVideoBtn.style.display = "none";
+          processVideoBtn.disabled = !selectedVideoFile || !state.sourceLoaded;
+
+        } else if (data.status === "error") {
+          clearInterval(videoPollTimer);
+          videoStatusText.textContent = `❌ Lỗi: ${data.error}`;
+          cancelVideoBtn.style.display = "none";
+          processVideoBtn.disabled = false;
+        }
+      } catch {}
+    }
+
+    // Enable processVideoBtn sau khi upload source thành công
+    // (hook vào fileInput change → sau khi upload OK)
+    const _origSourceUpload = fileInput;
+    document.body.addEventListener("source-face-ready", () => {
+      if (selectedVideoFile) processVideoBtn.disabled = false;
+    });
   </script>
 </body>
 </html>

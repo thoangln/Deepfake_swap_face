@@ -281,6 +281,158 @@ class FaceSwapper:
                 ) if self._frame_count > 0 else "no_data",
             }
 
+    def process_video(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback=None,
+        cancel_event=None,
+    ) -> bool:
+        """
+        Swap face trên từng frame của video MP4.
+
+        Args:
+            input_path:        Đường dẫn file MP4 đầu vào.
+            output_path:       Đường dẫn file MP4 đầu ra (có audio gốc).
+            progress_callback: Callable(frames_done, frames_total) — cập nhật tiến độ.
+            cancel_event:      threading.Event — set() để dừng xử lý sớm.
+
+        Returns:
+            True nếu hoàn thành, False nếu bị cancel.
+
+        Pipeline:
+            1. cv2.VideoCapture đọc từng frame
+            2. _fast_swap_face() — bỏ qua JPEG encode/decode (nhanh hơn process_frame)
+            3. cv2.VideoWriter ghi ra file tạm (không có audio)
+            4. ffmpeg mux audio gốc vào video đã swap → output_path
+        """
+        import subprocess
+        import tempfile
+
+        with self._lock:
+            source_latent = self._source_latent
+
+        if source_latent is None:
+            raise RuntimeError("Chưa upload source face")
+
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Không mở được video: {input_path}")
+
+        fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Ghi ra file tạm (không có audio) — dùng mp4v codec (cross-platform)
+        tmp_video = output_path + ".tmp.mp4"
+        fourcc  = cv2.VideoWriter_fourcc(*"mp4v")
+        writer  = cv2.VideoWriter(tmp_video, fourcc, fps, (width, height))
+
+        cancelled = False
+        try:
+            done = 0
+            while True:
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    break
+
+                if cancel_event and cancel_event.is_set():
+                    cancelled = True
+                    break
+
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                faces = self.face_analyzer.get(frame_rgb)
+
+                if faces:
+                    result = frame_rgb
+                    with self._lock:
+                        lat = self._source_latent
+                    for face in faces:
+                        # Gọi trực tiếp _fast_swap_face để tránh JPEG encode/decode overhead
+                        # Tạm thời set _source_latent nếu khác (không cần vì đã read ở trên)
+                        result = self._fast_swap_face_with_latent(result, face, lat)
+                    frame_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+
+                writer.write(frame_bgr)
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total)
+
+        finally:
+            cap.release()
+            writer.release()
+
+        # Nếu bị cancel → dọn dẹp file tạm và trả về False
+        if cancelled:
+            import os as _os
+            if _os.path.exists(tmp_video):
+                _os.remove(tmp_video)
+            return False
+
+        # Mux audio từ video gốc vào video đã swap bằng ffmpeg
+        # -y: overwrite output, -loglevel error: suppress verbose output
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", tmp_video,        # video đã swap (không có audio)
+            "-i", input_path,       # video gốc (lấy audio track)
+            "-c:v", "copy",         # giữ nguyên video stream
+            "-c:a", "aac",          # encode audio sang AAC
+            "-map", "0:v:0",        # video từ stream 0
+            "-map", "1:a:0?",       # audio từ stream 1 (? = optional, nếu video gốc không có audio thì bỏ qua)
+            "-shortest",            # cắt theo stream ngắn hơn
+            output_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        finally:
+            import os
+            if os.path.exists(tmp_video):
+                os.remove(tmp_video)
+
+        return True
+
+    def _fast_swap_face_with_latent(
+        self, img: np.ndarray, target_face, latent: np.ndarray
+    ) -> np.ndarray:
+        """
+        Giống _fast_swap_face() nhưng nhận latent trực tiếp thay vì đọc từ self._source_latent.
+        Dùng trong process_video() để tránh acquire lock mỗi frame.
+        """
+        from insightface.utils import face_align as _face_align
+        aimg, M = _face_align.norm_crop2(img, target_face.kps, 128)
+        blob = cv2.dnn.blobFromImage(aimg, 1.0 / 255.0, (128, 128), (0, 0, 0), swapRB=True)
+
+        pred = self._swap_session.run(
+            self._output_names,
+            {self._input_names[0]: blob, self._input_names[1]: latent}
+        )[0]
+
+        img_fake  = pred.transpose((0, 2, 3, 1))[0]
+        bgr_fake  = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:, :, ::-1]
+
+        IM = cv2.invertAffineTransform(M)
+        h, w = img.shape[:2]
+        face_warped = cv2.warpAffine(bgr_fake, IM, (w, h), borderValue=0)
+        mask_warped = cv2.warpAffine(self._blend_mask_128, IM, (w, h), borderValue=0)
+
+        rows = np.any(mask_warped > 0.01, axis=1)
+        cols = np.any(mask_warped > 0.01, axis=0)
+        if not rows.any():
+            return img
+
+        y1, y2 = np.where(rows)[0][[0, -1]]
+        x1, x2 = np.where(cols)[0][[0, -1]]
+
+        mask_roi = mask_warped[y1:y2+1, x1:x2+1, np.newaxis]
+        result = img.copy()
+        result[y1:y2+1, x1:x2+1] = (
+            mask_roi * face_warped[y1:y2+1, x1:x2+1] +
+            (1 - mask_roi) * img[y1:y2+1, x1:x2+1]
+        ).astype(np.uint8)
+
+        return result
+
     @property
     def has_source_face(self) -> bool:
         with self._lock:
