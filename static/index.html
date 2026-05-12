@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deepfake Demo — Face Swap</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0f0f13;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px;
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 600;
+      margin-bottom: 6px;
+      background: linear-gradient(90deg, #7c6af7, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .subtitle {
+      font-size: 0.85rem;
+      color: #666;
+      margin-bottom: 28px;
+    }
+
+    /* === Control Panel === */
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-bottom: 24px;
+      padding: 16px 20px;
+      background: #1a1a24;
+      border-radius: 12px;
+      border: 1px solid #2a2a38;
+      width: 100%;
+      max-width: 860px;
+    }
+
+    .status-badge {
+      font-size: 0.78rem;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-weight: 500;
+    }
+    .status-badge.idle     { background: #2a2a38; color: #999; }
+    .status-badge.ready    { background: #1a3a1a; color: #4ade80; }
+    .status-badge.active   { background: #1a2a3a; color: #60a5fa; }
+    .status-badge.warning  { background: #3a2a10; color: #fb923c; }
+    .status-badge.error    { background: #3a1a1a; color: #f87171; }
+
+    label.upload-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      background: #2a2a3e;
+      border: 1px solid #4a4a6a;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.88rem;
+      transition: background 0.2s;
+    }
+    label.upload-btn:hover { background: #3a3a54; }
+
+    #fileInput { display: none; }
+
+    button {
+      padding: 8px 18px;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.88rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    #startBtn {
+      background: #7c6af7;
+      color: #fff;
+    }
+    #startBtn:hover:not(:disabled)  { background: #6455d6; }
+    #startBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    #stopBtn {
+      background: #3a1a1a;
+      color: #f87171;
+      border: 1px solid #5a2a2a;
+    }
+    #stopBtn:hover:not(:disabled) { background: #4a2a2a; }
+    #stopBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    /* === Video Panel === */
+    .panels {
+      display: flex;
+      gap: 20px;
+      justify-content: center;
+      flex-wrap: wrap;
+      width: 100%;
+      max-width: 880px;
+    }
+
+    .panel {
+      flex: 1;
+      min-width: 300px;
+      max-width: 420px;
+      background: #1a1a24;
+      border-radius: 12px;
+      border: 1px solid #2a2a38;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 10px 14px;
+      font-size: 0.82rem;
+      color: #888;
+      border-bottom: 1px solid #2a2a38;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .panel-header .label {
+      font-weight: 600;
+      color: #bbb;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+    }
+
+    .fps-counter {
+      font-family: monospace;
+      font-size: 0.78rem;
+      color: #4ade80;
+    }
+
+    .video-wrap {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 4/3;
+      background: #0a0a10;
+    }
+
+    video, canvas {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    /* Mirror webcam — selfie-mode tự nhiên (trái-phải đúng chiều) */
+    video { transform: scaleX(-1); }
+
+    /* Placeholder overlay khi chưa có source face */
+    .placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #444;
+      font-size: 0.85rem;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .placeholder .icon { font-size: 2.4rem; }
+
+    /* Source face preview */
+    .source-preview {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-top: 1px solid #2a2a38;
+      min-height: 52px;
+    }
+    .source-preview img {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      object-fit: cover;
+      border: 2px solid #7c6af7;
+    }
+    .source-preview .info { font-size: 0.8rem; color: #888; }
+    .source-preview .info strong { color: #ccc; display: block; }
+
+    /* === Log === */
+    .log-panel {
+      margin-top: 20px;
+      width: 100%;
+      max-width: 860px;
+      background: #0a0a10;
+      border: 1px solid #1e1e2e;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-family: monospace;
+      font-size: 0.78rem;
+      color: #555;
+      max-height: 90px;
+      overflow-y: auto;
+    }
+    .log-panel .log-line { margin-bottom: 2px; }
+    .log-panel .log-line.info  { color: #60a5fa; }
+    .log-panel .log-line.ok    { color: #4ade80; }
+    .log-panel .log-line.warn  { color: #fb923c; }
+    .log-panel .log-line.err   { color: #f87171; }
+
+    /* === Metrics Panel === */
+    .metrics-panel {
+      margin-top: 12px;
+      width: 100%;
+      max-width: 860px;
+      background: #0f0f1a;
+      border: 1px solid #2a2a40;
+      border-radius: 10px;
+      padding: 14px 18px;
+    }
+    .metrics-title {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: #888;
+      margin-bottom: 12px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .metrics-grid { display: flex; flex-direction: column; gap: 8px; }
+    .metric-row {
+      display: grid;
+      grid-template-columns: 160px 1fr 70px;
+      align-items: center;
+      gap: 10px;
+    }
+    .m-label { font-size: 0.78rem; color: #888; font-family: monospace; }
+    .m-bar-wrap { background: #1a1a2e; border-radius: 4px; height: 8px; overflow: hidden; }
+    .m-bar { height: 100%; border-radius: 4px; transition: width 0.3s ease; background: #7c6af7; min-width: 2px; }
+    .m-val { font-size: 0.78rem; font-family: monospace; color: #ccc; text-align: right; }
+    .metric-row.total .m-label { color: #e0e0e0; font-weight: 600; }
+    .metric-row.total .m-val   { color: #4ade80; font-weight: 600; font-size: 0.85rem; }
+    .bottleneck {
+      margin-top: 10px;
+      font-size: 0.76rem;
+      color: #fb923c;
+      font-family: monospace;
+    }
+    /* Bottleneck bar highlight */
+    .m-bar.bottleneck-bar { background: #f97316; }
+  </style>
+</head>
+<body>
+
+  <h1>Deepfake Face Swap Demo</h1>
+  <p class="subtitle">InsightFace + inswapper_128 · Local only · Research use</p>
+
+  <!-- ===== Controls ===== -->
+  <div class="controls">
+    <span id="statusBadge" class="status-badge idle">● Chưa bắt đầu</span>
+
+    <label class="upload-btn" for="fileInput">
+      📁 Upload Source Face
+    </label>
+    <input type="file" id="fileInput" accept="image/*" />
+
+    <button id="startBtn">▶ Bắt đầu Swap</button>
+    <button id="stopBtn" disabled>■ Dừng</button>
+  </div>
+
+  <!-- ===== Video Panels ===== -->
+  <div class="panels">
+
+    <!-- Webcam gốc -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="label">Webcam gốc</span>
+        <span id="sendFps" class="fps-counter">– FPS</span>
+      </div>
+      <div class="video-wrap">
+        <video id="webcamVideo" autoplay muted playsinline></video>
+      </div>
+      <div class="source-preview" id="sourcePreview">
+        <span style="color:#555; font-size:0.8rem;">Chưa có source face</span>
+      </div>
+    </div>
+
+    <!-- Output đã swap -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="label">Face Swap Output</span>
+        <span id="recvFps" class="fps-counter">– FPS</span>
+      </div>
+      <div class="video-wrap">
+        <canvas id="outputCanvas"></canvas>
+        <div class="placeholder" id="placeholder">
+          <span class="icon">🎭</span>
+          <span>Upload source face & bắt đầu swap</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ===== Log ===== -->
+  <div class="log-panel" id="logPanel"></div>
+
+  <!-- ===== Metrics Panel ===== -->
+  <div class="metrics-panel" id="metricsPanel" style="display:none;">
+    <div class="metrics-title">⏱ Pipeline Timing (rolling avg 30 frames)</div>
+    <div class="metrics-grid">
+      <div class="metric-row" id="m-decode">
+        <span class="m-label">① Decode + ColorConv</span>
+        <div class="m-bar-wrap"><div class="m-bar" id="bar-decode"></div></div>
+        <span class="m-val" id="val-decode">–</span>
+      </div>
+      <div class="metric-row" id="m-detect">
+        <span class="m-label">② SCRFD Detection</span>
+        <div class="m-bar-wrap"><div class="m-bar" id="bar-detect"></div></div>
+        <span class="m-val" id="val-detect">–</span>
+      </div>
+      <div class="metric-row" id="m-swap">
+        <span class="m-label">③ inswapper + Blend</span>
+        <div class="m-bar-wrap"><div class="m-bar" id="bar-swap"></div></div>
+        <span class="m-val" id="val-swap">–</span>
+      </div>
+      <div class="metric-row" id="m-encode">
+        <span class="m-label">④ Encode JPEG</span>
+        <div class="m-bar-wrap"><div class="m-bar" id="bar-encode"></div></div>
+        <span class="m-val" id="val-encode">–</span>
+      </div>
+      <div class="metric-row total">
+        <span class="m-label">TOTAL / FPS</span>
+        <div class="m-bar-wrap"></div>
+        <span class="m-val" id="val-total">–</span>
+      </div>
+    </div>
+    <div class="bottleneck" id="bottleneck-label"></div>
+  </div>
+
+  <!-- Hidden canvas dùng để capture webcam frame -->
+  <canvas id="captureCanvas" style="display:none;"></canvas>
+
+  <script>
+    // ========================================================
+    //  State
+    // ========================================================
+    const state = {
+      ws: null,           // WebSocket connection
+      stream: null,       // MediaStream từ getUserMedia
+      running: false,     // đang swap hay không
+      sourceLoaded: false,// đã upload source face chưa
+      sending: false,     // backpressure flag: đang chờ response từ server
+      sendCount: 0,       // đếm frame đã gửi (tính FPS)
+      recvCount: 0,       // đếm frame đã nhận (tính FPS)
+    };
+
+    // ========================================================
+    //  DOM refs
+    // ========================================================
+    const webcamVideo   = document.getElementById("webcamVideo");
+    const outputCanvas  = document.getElementById("outputCanvas");
+    const captureCanvas = document.getElementById("captureCanvas");
+    const fileInput     = document.getElementById("fileInput");
+    const startBtn      = document.getElementById("startBtn");
+    const stopBtn       = document.getElementById("stopBtn");
+    const statusBadge   = document.getElementById("statusBadge");
+    const sourcePreview = document.getElementById("sourcePreview");
+    const placeholder   = document.getElementById("placeholder");
+    const logPanel      = document.getElementById("logPanel");
+    const sendFpsEl     = document.getElementById("sendFps");
+    const recvFpsEl     = document.getElementById("recvFps");
+
+    const captureCtx = captureCanvas.getContext("2d");
+    const outputCtx  = outputCanvas.getContext("2d");
+
+    // ========================================================
+    //  Logging
+    // ========================================================
+    function log(msg, level = "info") {
+      const line = document.createElement("div");
+      line.className = `log-line ${level}`;
+      const time = new Date().toLocaleTimeString("vi-VN", { hour12: false });
+      line.textContent = `[${time}] ${msg}`;
+      logPanel.appendChild(line);
+      logPanel.scrollTop = logPanel.scrollHeight;
+    }
+
+    function setStatus(text, type) {
+      statusBadge.className = `status-badge ${type}`;
+      statusBadge.textContent = `● ${text}`;
+    }
+
+    // ========================================================
+    //  FPS Counters — cập nhật mỗi giây
+    // ========================================================
+    setInterval(() => {
+      sendFpsEl.textContent = `${state.sendCount} FPS`;
+      recvFpsEl.textContent = `${state.recvCount} FPS`;
+      state.sendCount = 0;
+      state.recvCount = 0;
+    }, 1000);
+
+    // ========================================================
+    //  Metrics Polling — poll /metrics mỗi 2s khi đang swap
+    // ========================================================
+    const metricsPanel = document.getElementById("metricsPanel");
+    const bottleneckLabel = document.getElementById("bottleneck-label");
+    const stepKeys = ["decode_colorconv", "scrfd_detection", "inswapper_blend", "encode_jpeg"];
+    const stepIds  = ["decode", "detect", "swap", "encode"];
+
+    async function pollMetrics() {
+      if (!state.running) return;
+      try {
+        const res = await fetch("/metrics");
+        const d = await res.json();
+        const steps = d.steps_ms;
+        const total = steps.total.avg;
+        if (total === 0) return;
+
+        // Tìm max để scale bar
+        const vals = stepIds.map((_, i) => steps[stepKeys[i]].avg);
+        const maxVal = Math.max(...vals, 1);
+
+        stepIds.forEach((id, i) => {
+          const key = stepKeys[i];
+          const avg = steps[key].avg;
+          const max = steps[key].max;
+          const pct = Math.min((avg / maxVal) * 100, 100);
+          const isBottleneck = key === d.bottleneck;
+
+          const bar = document.getElementById(`bar-${id}`);
+          bar.style.width = pct + "%";
+          bar.className = "m-bar" + (isBottleneck ? " bottleneck-bar" : "");
+          document.getElementById(`val-${id}`).textContent =
+            `${avg.toFixed(1)}ms (max ${max.toFixed(0)})`;
+        });
+
+        document.getElementById("val-total").textContent =
+          `${total.toFixed(1)}ms · ${d.fps_avg} FPS`;
+
+        // Bottleneck label với gợi ý tối ưu
+        const hints = {
+          decode_colorconv: "→ Gợi ý: giảm JPEG quality client hoặc resolution",
+          scrfd_detection:  "→ Gợi ý: giảm det_size xuống (160,160) hoặc tăng det_thresh",
+          inswapper_blend:  "→ Gợi ý: đây là bottleneck chính, cần GPU để tăng tốc đáng kể",
+          encode_jpeg:      "→ Gợi ý: giảm JPEG quality server (80→60) hoặc encode async",
+        };
+        bottleneckLabel.textContent = d.bottleneck !== "no_data"
+          ? `🔥 Bottleneck: ${d.bottleneck}  ${hints[d.bottleneck] || ""}`
+          : "";
+      } catch {}
+    }
+
+    setInterval(pollMetrics, 2000);
+
+    // ========================================================
+    //  Upload Source Face
+    //  Giải thích: gửi ảnh lên POST /upload-source qua FormData
+    //  Server sẽ extract face embedding và lưu lại
+    // ========================================================
+    fileInput.addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      log(`Đang upload "${file.name}"...`);
+      setStatus("Đang xử lý ảnh...", "active");
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      try {
+        const res = await fetch("/upload-source", {
+          method: "POST",
+          body: formData,
+          // KHÔNG set Content-Type header — browser tự set multipart boundary
+        });
+
+        const data = await res.json();
+
+        if (res.ok) {
+          state.sourceLoaded = true;
+          log(data.message, "ok");
+          setStatus("Source face ready", "ready");
+          startBtn.disabled = false;
+
+          // Preview ảnh source face nhỏ
+          const imgUrl = URL.createObjectURL(file);
+          sourcePreview.innerHTML = `
+            <img src="${imgUrl}" alt="source face" />
+            <div class="info">
+              <strong>Source Face</strong>
+              ${file.name} · ${(file.size / 1024).toFixed(0)}KB
+            </div>`;
+        } else {
+          log(`Lỗi: ${data.detail}`, "err");
+          setStatus("Lỗi upload", "error");
+        }
+      } catch (err) {
+        log(`Lỗi kết nối server: ${err.message}`, "err");
+        setStatus("Lỗi kết nối", "error");
+      }
+    });
+
+    // ========================================================
+    //  Start Swap
+    //  Flow:
+    //    1. getUserMedia() → lấy webcam stream
+    //    2. Kết nối WebSocket /ws
+    //    3. setInterval 100ms: capture frame → gửi qua WS
+    //    4. ws.onmessage: nhận frame đã swap → vẽ lên canvas
+    // ========================================================
+    startBtn.addEventListener("click", async () => {
+      if (state.running) return;
+
+      // Bước 1: Lấy webcam stream
+      try {
+        state.stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 480, height: 360, frameRate: { ideal: 15 } },
+          audio: false
+        });
+        webcamVideo.srcObject = state.stream;
+        log("Webcam OK (480x360, mirrored)", "ok");
+      } catch (err) {
+        log(`Không thể truy cập webcam: ${err.message}`, "err");
+        setStatus("Lỗi webcam", "error");
+        return;
+      }
+
+      // Bước 2: Kết nối WebSocket
+      // ws:// vì server local không có HTTPS
+      const wsUrl = `ws://${location.host}/ws`;
+      state.ws = new WebSocket(wsUrl);
+      state.ws.binaryType = "arraybuffer"; // nhận binary data dưới dạng ArrayBuffer
+
+      state.ws.onopen = () => {
+        log("WebSocket connected", "ok");
+        state.running = true;
+        state.sending = false;
+        setStatus("Đang swap...", "active");
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        placeholder.style.display = "none";
+        metricsPanel.style.display = "block";
+
+        // 480×360: giảm ~44% pixels so với 640×480
+        // → JPEG nhẹ hơn, server xử lý nhanh hơn, latency giảm đáng kể
+        captureCanvas.width  = 480;
+        captureCanvas.height = 360;
+        outputCanvas.width   = 480;
+        outputCanvas.height  = 360;
+
+        // Bước 3: Kick off request-response loop
+        // Thay vì setInterval (gửi liên tục bất kể server xử lý xong chưa),
+        // dùng request-response: send → chờ nhận response → send tiếp
+        // → WS buffer không bao giờ tích lũy → latency = đúng 1 round-trip
+        sendNextFrame();
+      };
+
+      // Bước 4: Nhận response từ server → render → gửi frame tiếp theo
+      state.ws.onmessage = (event) => {
+        state.sending = false; // unblock backpressure
+
+        if (event.data instanceof ArrayBuffer) {
+          // Binary data = JPEG frame đã swap → render lên canvas
+          const blob = new Blob([event.data], { type: "image/jpeg" });
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+          img.onload = () => {
+            outputCtx.drawImage(img, 0, 0, 480, 360);
+            URL.revokeObjectURL(url); // giải phóng memory
+            state.recvCount++;
+          };
+          img.src = url;
+        } else {
+          // Text message = JSON warning/error từ server
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "warning") log(msg.message, "warn");
+            if (msg.type === "error")   { log(msg.message, "err"); return; } // lỗi nghiêm trọng → dừng
+          } catch {}
+        }
+
+        // Gửi frame tiếp theo ngay sau khi nhận response
+        // → tự động adapt theo tốc độ server, không bao giờ tạo backlog
+        sendNextFrame();
+      };
+
+      state.ws.onerror = (e) => {
+        log("WebSocket error", "err");
+        setStatus("Lỗi kết nối", "error");
+      };
+
+      state.ws.onclose = () => {
+        if (state.running) {
+          log("WebSocket bị đóng", "warn");
+          stopSwap();
+        }
+      };
+    });
+
+    // ========================================================
+    //  sendNextFrame — Request-Response Loop
+    //  Capture webcam frame → encode JPEG → send qua WebSocket
+    //  Chỉ gửi khi state.sending=false (chưa có frame đang chờ response)
+    // ========================================================
+    function sendNextFrame() {
+      if (!state.running || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      if (state.sending) return; // backpressure: frame trước chưa được xử lý
+
+      state.sending = true;
+
+      // Mirror capture: flip horizontal để khớp với video preview (selfie-mode)
+      // save() → scale(-1,1) → drawImage offset → restore() là pattern chuẩn cho mirror
+      captureCtx.save();
+      captureCtx.scale(-1, 1);
+      captureCtx.drawImage(webcamVideo, -480, 0, 480, 360);
+      captureCtx.restore();
+
+      // quality=0.6: giảm payload, đủ chất lượng cho face swap detection
+      captureCanvas.toBlob(blob => {
+        if (!blob || !state.running || state.ws.readyState !== WebSocket.OPEN) {
+          state.sending = false;
+          return;
+        }
+        blob.arrayBuffer().then(buf => {
+          state.ws.send(buf);
+          state.sendCount++;
+        });
+      }, "image/jpeg", 0.55);
+    }
+
+    // ========================================================
+    //  Stop Swap
+    // ========================================================
+    stopBtn.addEventListener("click", stopSwap);
+
+    function stopSwap() {
+      state.running = false;
+      state.sending = false;
+
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.close();
+      }
+
+      if (state.stream) {
+        state.stream.getTracks().forEach(t => t.stop());
+        state.stream = null;
+      }
+
+      webcamVideo.srcObject = null;
+      startBtn.disabled = !state.sourceLoaded;
+      stopBtn.disabled = true;
+      placeholder.style.display = "flex";
+      metricsPanel.style.display = "none";
+
+      log("Đã dừng swap", "info");
+      setStatus(state.sourceLoaded ? "Source face ready" : "Chưa bắt đầu", state.sourceLoaded ? "ready" : "idle");
+    }
+
+    // ========================================================
+    //  Init
+    // ========================================================
+    startBtn.disabled = true; // cần upload source trước mới enable
+    log("Server sẵn sàng. Hãy upload source face rồi bắt đầu swap.", "info");
+  </script>
+</body>
+</html>

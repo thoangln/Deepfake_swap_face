@@ -1,0 +1,37 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Environment
+.env
+.env.*
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Models (mount via volume, không copy vào image nếu muốn dùng volume)
+# Bỏ comment dòng dưới nếu muốn KHÔNG bake model vào image (dùng bind mount thay)
+# models/
+
+# Git
+.git/
+.gitignore
+
+# Logs
+*.log
+logs/
+
+# Temp
+tmp/
+temp/

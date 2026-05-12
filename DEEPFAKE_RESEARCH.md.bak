@@ -1,0 +1,465 @@
+# Deepfake Research — Tài liệu kỹ thuật
+
+> Tài liệu dành cho buổi sharing nội bộ công ty.
+> Mục tiêu: Real-time face swap qua webcam trên browser, chạy hoàn toàn local.
+
+---
+
+## Mục lục
+
+1. [Khái niệm quan trọng](#1-khái-niệm-quan-trọng)
+2. [Các Model và mục đích](#2-các-model-và-mục-đích)
+3. [Thông số điều chỉnh trong code](#3-thông-số-điều-chỉnh-trong-code)
+4. [Flow Diagram](#4-flow-diagram)
+5. [Vấn đề gặp phải và cách giải quyết](#5-vấn-đề-gặp-phải-và-cách-giải-quyết)
+
+---
+
+## 1. Khái niệm quan trọng
+
+### 1.1 Deepfake là gì?
+
+**Deepfake** = Deep Learning + Fake. Kỹ thuật dùng neural network để tổng hợp nội dung media (ảnh, video, âm thanh) trông có vẻ thật nhưng thực ra là giả.
+
+Có 3 loại chính:
+- **Face Swap**: thay khuôn mặt người A lên cơ thể/video của người B ← *dự án này*
+- **Face Reenactment**: điều khiển biểu cảm khuôn mặt theo video nguồn (First Order Motion)
+- **Voice Cloning**: clone giọng nói từ vài giây audio mẫu
+
+### 1.2 ONNX và ONNX Runtime
+
+```
+Neural Network (PyTorch/TensorFlow)
+            ↓ export
+         .onnx file  ←── format trung gian, platform-agnostic
+            ↓ load
+      ONNX Runtime   ←── inference engine chạy .onnx
+      (CPU / GPU / ANE)
+```
+
+**ONNX (Open Neural Network Exchange)**: định dạng file chung để lưu neural network, không phụ thuộc framework nào. Như Docker image nhưng cho AI model.
+
+**ONNX Runtime**: engine chạy các file `.onnx`. Tối ưu cho từng hardware (CPU, NVIDIA CUDA, Apple CoreML/ANE).
+
+### 1.3 Face Embedding — trái tim của face swap
+
+**Embedding** là cách biểu diễn khuôn mặt dưới dạng **vector 512 số thực**.
+
+```
+Khuôn mặt A  →  ArcFace  →  [0.12, -0.87, 0.34, ..., 0.91]  (512 số)
+                                        ↑
+                              "DNA kỹ thuật số" của khuôn mặt
+```
+
+Hai khuôn mặt giống nhau → hai vector gần nhau trong không gian 512 chiều (cosine similarity cao).
+
+**Tại sao dùng embedding thay vì copy pixel?** Vì embedding nắm bắt *đặc trưng bản chất* (hình dạng mắt, tỷ lệ mũi...) độc lập với góc độ, ánh sáng. `inswapper_128` dùng embedding này để "in" đặc trưng của source vào target mà vẫn giữ nguyên pose/ánh sáng của target.
+
+### 1.4 WebSocket — tại sao không dùng HTTP?
+
+| | HTTP Request/Response | WebSocket |
+|---|---|---|
+| **Connection** | Tạo mới mỗi request | Giữ 1 connection liên tục |
+| **Overhead** | Header ~800 bytes/request | Header ~2 bytes/frame |
+| **Latency** | ~50-200ms per request | ~1-5ms per frame |
+| **Direction** | Client → Server only | Bidirectional (full-duplex) |
+| **Dùng cho** | REST API, file upload | Real-time streaming, chat, game |
+
+Ở 10 FPS, HTTP sẽ tạo 600 connections/phút. WebSocket giữ 1 connection duy nhất → phù hợp cho video streaming.
+
+### 1.5 Backpressure — chìa khóa giảm latency
+
+**Vấn đề:** Nếu gửi frame theo `setInterval(100ms)` nhưng server xử lý mất 200ms/frame → frames xếp hàng trong buffer → latency tăng dần theo thời gian.
+
+```
+Sai (setInterval):
+t=0ms    gửi frame 1
+t=100ms  gửi frame 2  ← server vẫn đang xử lý frame 1
+t=200ms  gửi frame 3  ← buffer: [2, 3] đang chờ
+t=200ms  nhận frame 1 (latency = 200ms)
+t=400ms  nhận frame 2 (latency = 300ms, tăng dần!)
+t=800ms  nhận frame 4 (latency = 600ms, tiếp tục tăng!)
+```
+
+```
+Đúng (Request-Response):
+t=0ms    gửi frame 1
+t=200ms  nhận frame 1 → ngay lập tức gửi frame 2  (latency = 200ms, cố định)
+t=400ms  nhận frame 2 → gửi frame 3               (latency = 200ms)
+```
+
+**Backpressure**: kỹ thuật producer (client) tự điều tiết tốc độ theo consumer (server). Client chỉ gửi frame tiếp theo sau khi nhận response.
+
+### 1.6 Async/Await và run_in_executor
+
+**Asyncio event loop**: Python chạy 1 thread duy nhất, luân phiên xử lý nhiều coroutine bằng cách yield control khi `await`.
+
+```
+Vấn đề: face swap là CPU-bound (~150ms), không có await bên trong
+→ Block toàn bộ event loop trong 150ms
+→ Server không xử lý được request nào khác trong thời gian đó
+```
+
+```python
+# Sai: block event loop
+result = face_swapper.process_frame(frame_bytes)
+
+# Đúng: offload sang thread pool
+result = await loop.run_in_executor(None, face_swapper.process_frame, frame_bytes)
+#                                    ↑
+#                          ThreadPoolExecutor mặc định của Python
+```
+
+`run_in_executor` chạy function trong thread pool → event loop free để xử lý health check, upload request... song song.
+
+---
+
+## 2. Các Model và mục đích
+
+### Bộ buffalo_l (tự động download ~275MB)
+
+```
+~/.insightface/models/buffalo_l/
+├── det_10g.onnx         ← SCRFD face detector
+├── w600k_r50.onnx       ← ArcFace ResNet50 (face recognition)
+├── 1k3d68.onnx          ← 3D Landmark (68 điểm) [không dùng trong project này]
+├── 2d106det.onnx        ← 2D Landmark (106 điểm) [không dùng]
+└── genderage.onnx       ← Gender/Age classifier   [không dùng]
+```
+
+#### det_10g.onnx — SCRFD Face Detector
+
+| Thuộc tính | Chi tiết |
+|---|---|
+| **Kiến trúc** | SCRFD (Sample- and Computation-Redistributed Face Detection) |
+| **Input** | Frame ảnh bất kỳ kích thước (resize về det_size trước) |
+| **Output** | List bounding boxes + 5 facial landmarks (mắt, mũi, 2 góc miệng) |
+| **Tại sao SCRFD?** | Thiết kế đặc biệt cho face detection: nhanh hơn YOLO trên face, cân bằng tốc độ/accuracy |
+| **Hiểu nôm na** | "Camera quét, khoanh đỏ vị trí khuôn mặt" |
+
+```
+Frame 480×360
+    → resize xuống 320×320 (det_size)
+    → SCRFD convolution
+    → [bbox: (x1,y1,x2,y2), landmarks: 5 điểm, score: 0.87]
+```
+
+#### w600k_r50.onnx — ArcFace ResNet50
+
+| Thuộc tính | Chi tiết |
+|---|---|
+| **Kiến trúc** | ResNet-50 + ArcFace loss |
+| **Input** | Ảnh khuôn mặt đã crop + align 112×112 |
+| **Output** | Vector 512 chiều (face embedding / "face fingerprint") |
+| **Training data** | WebFace600K — 600,000 identity, 5M ảnh |
+| **Hiểu nôm na** | "Đọc ADN số của khuôn mặt → lưu vào vector 512 số" |
+
+**ArcFace loss** (Angular Margin Loss): training làm cho embedding của cùng 1 người cluster lại gần nhau, khác người thì xa nhau trong không gian 512-D.
+
+### inswapper_128.onnx — Core Swap Model (download thủ công ~500MB)
+
+| Thuộc tính | Chi tiết |
+|---|---|
+| **Kiến trúc** | Encoder-Decoder với face reenactment architecture |
+| **Input 1** | Source face embedding (512-dim vector) |
+| **Input 2** | Target face region (crop từ webcam frame) |
+| **Output** | Swapped face region (128×128 pixels) |
+| **Hiểu nôm na** | "Lấy 'ADN số' của nguồn, in vào khuôn mặt đích, giữ nguyên góc độ/ánh sáng của đích" |
+
+```
+source_embedding (512-dim)  ──┐
+                               ├──► inswapper_128 ──► swapped_face_128x128
+target_face_crop (128×128)  ──┘
+```
+
+**paste_back=True**: sau khi swap 128×128, dùng Poisson blending để ghép seamlessly vào frame gốc (làm mờ biên, match màu sắc xung quanh).
+
+### Tổng quan pipeline models
+
+```
+SOURCE ảnh (upload 1 lần)
+└── SCRFD detect → crop face → ArcFace → embedding [512-dim] → lưu vào RAM
+
+WEBCAM frame (mỗi frame)
+└── SCRFD detect → [bbox, landmarks]
+    └── target_face crop → inswapper_128(embedding, crop) → swapped_128x128
+        └── Poisson blend → output frame
+```
+
+---
+
+## 3. Thông số điều chỉnh trong code
+
+### `app/face_swapper.py`
+
+```python
+# === DETECTION THRESHOLD ===
+det_thresh=0.35
+# Mặc định: 0.5
+# Range:    0.1 – 0.9
+# Tăng (→0.9): chỉ detect mặt rất rõ, ít false positive, hay bị miss khi xoay
+# Giảm (→0.1): detect được mặt mờ/nghiêng, nhiều false positive hơn
+# Sweet spot cho webcam realtime: 0.3 – 0.45
+
+# === DETECTION RESOLUTION ===
+det_size=(320, 320)
+# Mặc định InsightFace: (640, 640)
+# Cost tính toán tỷ lệ O(w×h): 320² = 4x nhanh hơn 640²
+# Giảm xuống (160, 160): nhanh hơn nữa nhưng miss mặt nhỏ trong frame
+# Tăng lên (640, 640): chính xác hơn, detect được mặt nhỏ hơn, chậm hơn ~4x
+
+# === FALLBACK FRAMES (temporal smoothing) ===
+self.FALLBACK_FRAMES = 6
+# Số frame liên tiếp không detect được mặt → dùng frame swap cuối
+# Ở 10 FPS: 6 frames = 600ms "đóng băng" khi quay đi quay lại
+# Tăng (→15): mượt hơn khi xoay nhanh, nhưng output "trễ" khi mặt biến mất thật
+# Giảm (→2): responsive hơn khi mặt biến mất, nhưng hay flash khi di chuyển nhanh
+
+# === ENCODE QUALITY (server-side) ===
+cv2.IMWRITE_JPEG_QUALITY, 80
+# Range: 0-100
+# 80: balance quality/size (default)
+# 60-70: nhỏ hơn ~30%, chấp nhận được cho face swap output
+# 90+: gần như lossless, tăng bandwidth đáng kể
+```
+
+### `static/index.html` (Frontend)
+
+```javascript
+// === WEBCAM RESOLUTION ===
+video: { width: 480, height: 360, frameRate: { ideal: 15 } }
+// 480×360: balance giữa quality và processing speed
+// 640×480: nhiều detail hơn, server xử lý chậm hơn ~44%
+// 320×240: rất nhanh, face detection kém chính xác hơn
+
+// === JPEG QUALITY (client-side) ===
+captureCanvas.toBlob(blob => {...}, "image/jpeg", 0.55)
+// Range: 0.0 – 1.0
+// 0.55: nhỏ (~15-25KB/frame), đủ cho SCRFD detect mặt
+// 0.8+: giữ detail tốt hơn, tăng latency do payload lớn
+// 0.3-: quá mờ, SCRFD khó detect
+
+// === FALLBACK_FRAMES sync ===
+// Giữ đồng bộ với FALLBACK_FRAMES trong face_swapper.py
+```
+
+### `docker-compose.yml`
+
+```yaml
+deploy:
+  resources:
+    limits:
+      memory: 4G     # Tăng nếu load thêm model (GFPGAN cần thêm ~1GB)
+    reservations:
+      memory: 1G     # RAM tối thiểu để load buffalo_l + inswapper
+```
+
+### Bảng tóm tắt thông số và ảnh hưởng
+
+| Thông số | File | Giá trị hiện tại | Giảm → | Tăng → |
+|---|---|---|---|---|
+| `det_thresh` | face_swapper.py | 0.35 | Detect mặt khó hơn | Nhiều false positive |
+| `det_size` | face_swapper.py | 320×320 | Nhanh hơn, miss mặt nhỏ | Chậm hơn, detect tốt hơn |
+| `FALLBACK_FRAMES` | face_swapper.py | 6 | Nhanh phản hồi khi mặt mất | Mượt hơn khi xoay |
+| JPEG quality server | face_swapper.py | 80 | Nhỏ hơn, mờ hơn | To hơn, rõ hơn |
+| Webcam width | index.html | 480 | Nhanh hơn, mờ hơn | Chậm hơn, rõ hơn |
+| JPEG quality client | index.html | 0.55 | Nhỏ hơn, latency thấp | To hơn, latency cao |
+
+---
+
+## 4. Flow Diagram
+
+### 4.1 System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        BROWSER                              │
+│                                                             │
+│  ┌─────────────┐    mirror CSS     ┌──────────────────┐    │
+│  │  <video>    │◄──────────────    │  Webcam Stream   │    │
+│  │  (preview)  │   scaleX(-1)      │  getUserMedia()  │    │
+│  └─────────────┘                   └──────────────────┘    │
+│                                             │               │
+│                                    drawImage (mirrored)     │
+│                                             ▼               │
+│                                    ┌─────────────────┐     │
+│                                    │ Hidden Canvas   │     │
+│                                    │ 480×360         │     │
+│                                    └────────┬────────┘     │
+│                                             │ toBlob JPEG  │
+│  ┌─────────────┐                            │ quality=0.55 │
+│  │   Output    │◄── drawImage ──── WS ◄─────┘             │
+│  │   Canvas    │    480×360    binary frame                 │
+│  │  (swapped)  │                  ▲                        │
+│  └─────────────┘                  │ send next frame        │
+│                                   │ (on message received)  │
+└───────────────────────────────────┼────────────────────────┘
+                                    │ WebSocket /ws
+                      ┌─────────────┴──────────────────────────┐
+                      │           FASTAPI SERVER                │
+                      │                                         │
+                      │  websocket_endpoint()                   │
+                      │    │ receive_bytes()                    │
+                      │    │                                    │
+                      │    ▼ run_in_executor (thread pool)      │
+                      │  ┌─────────────────────────────────┐   │
+                      │  │       FaceSwapper Engine        │   │
+                      │  │                                 │   │
+                      │  │  1. decode JPEG → numpy BGR     │   │
+                      │  │  2. downscale if width > 480    │   │
+                      │  │  3. BGR → RGB                   │   │
+                      │  │  4. SCRFD detect faces          │   │
+                      │  │     ↳ miss? → temporal cache    │   │
+                      │  │  5. inswapper.get(              │   │
+                      │  │       frame, target, source)    │   │
+                      │  │  6. RGB → BGR → JPEG encode     │   │
+                      │  └─────────────────────────────────┘   │
+                      │    │ send_bytes()                       │
+                      └────┼────────────────────────────────────┘
+                           │
+                    swapped JPEG frame
+```
+
+### 4.2 Model Pipeline (per frame)
+
+```
+WEBCAM FRAME (480×360 JPEG)
+│
+├─[decode]──► numpy array BGR (480×360×3)
+│
+├─[downscale]──► nếu width > 480 → resize proportional
+│
+├─[BGR→RGB]──► numpy array RGB
+│
+├─[SCRFD det_10g.onnx]──────────────────────────────────────────┐
+│   Input:  resize frame → 320×320                              │
+│   Output: [Face(bbox, kps, det_score), ...]                   │
+│                                                               │
+│   Face không detect? ──► temporal cache (FALLBACK_FRAMES=6)  │
+│                                                               │
+└─[for each detected face]                                      │
+    │                                                           │
+    ├─ target_face = Face object (bbox + 5 landmarks)           │
+    │                                                           │
+    └─[inswapper_128.onnx]                                      │
+        Input 1: source_embedding (512-dim) ◄── từ RAM ─────────┘
+        Input 2: target_face crop (align → 128×128)
+        Process: Encoder-Decoder + Poisson blend
+        Output:  swapped frame RGB (paste_back=True)
+│
+├─[RGB→BGR]──► numpy array BGR
+│
+└─[JPEG encode quality=80]──► bytes → WebSocket → Browser
+```
+
+### 4.3 Source Face Setup (1 lần duy nhất)
+
+```
+USER upload ảnh source
+│
+├─[decode]──► numpy BGR
+├─[BGR→RGB]──► numpy RGB
+├─[SCRFD detect]──► danh sách faces
+│   └── chọn face lớn nhất (bbox area tối đa)
+├─[ArcFace w600k_r50.onnx]──► embedding [512-dim float32]
+└─[lưu vào RAM]──► self._source_face
+                   (dùng cho mọi frame tiếp theo)
+```
+
+### 4.4 Request-Response Loop (chống backpressure)
+
+```
+Browser                          Server
+  │                                │
+  │──── frame N (JPEG binary) ────►│
+  │                                │ process (~150-300ms)
+  │                                │ run_in_executor
+  │◄─── swapped frame N ───────────│
+  │                                │
+  │  ngay lập tức:                 │
+  │──── frame N+1 ─────────────────►│
+  │                                │ process
+  │◄─── swapped frame N+1 ─────────│
+  │                                │
+  Latency = 1 round-trip (cố định) ✓
+  KHÔNG có queue/backlog           ✓
+```
+
+So sánh với setInterval:
+```
+Browser (setInterval 100ms)      Server
+  │──── frame 1 ────────────────►│
+  │──── frame 2 ─────────────────│ frame 1 đang xử lý
+  │──── frame 3 ─────────────────│ queue: [2, 3]
+  │◄─── frame 1 ─────────────────│ latency tăng dần → WS đóng
+```
+
+---
+
+## 5. Vấn đề gặp phải và cách giải quyết
+
+### 5.1 Bảng tổng hợp
+
+| Vấn đề | Root Cause | Giải pháp |
+|---|---|---|
+| Build Docker lỗi `g++ not found` | `insightface` compile Cython từ source, cần C++ compiler | Thêm `build-essential` vào Dockerfile |
+| `ml_dtypes` AttributeError | Version conflict giữa `onnx 1.19` và `ml_dtypes 0.4.x` | Pin `ml_dtypes>=0.5.0` |
+| CoreML `I/O error` trên M1 | InsightFace buffalo_l opset không tương thích CoreML | Dùng `CPUExecutionProvider` |
+| Miss face detection khi xoay | `det_thresh=0.5` quá cao, loại bỏ candidate khi mặt nghiêng | Giảm `det_thresh=0.35` |
+| Output nhấp nháy khi di chuyển nhanh | SCRFD miss 1-2 frame → frame trắng | Temporal smoothing cache |
+| Latency tăng dần theo thời gian | `setInterval` tạo backlog trong WS buffer | Request-Response loop |
+| Server freeze khi swap | `process_frame()` block asyncio event loop | `run_in_executor` |
+| Hình ảnh bị đảo ngược (mirror) | Webcam default selfie-mode | CSS `scaleX(-1)` + canvas mirror capture |
+| Docker no space left on device | Docker Desktop disk cache đầy | `docker system prune -af` |
+
+### 5.2 Lessons learned
+
+**Về AI/ML:**
+- Model lớn ≠ tốt hơn cho mọi use case. `det_size=320` đủ cho webcam, nhanh hơn 4x so với 640
+- `allowed_modules` quan trọng: bỏ 3/5 models không cần dùng → giảm 40% inference time
+- ONNX provider compatibility phải test thực tế, không phải cứ "hardware hỗ trợ" là "ONNX provider chạy được"
+
+**Về Real-time streaming:**
+- Backpressure là bắt buộc cho bất kỳ producer-consumer pipeline nào
+- `run_in_executor` là pattern chuẩn cho CPU-bound task trong async Python server
+- WebSocket phù hợp hơn HTTP cho video streaming vì giữ connection + bidirectional
+
+**Về Docker:**
+- `build-essential` cần thiết cho package Python có Cython extension
+- Named volume cho model cache tránh download lại mỗi lần restart
+- Disk space của Docker Desktop cần theo dõi khi làm việc với model lớn
+
+---
+
+## Tech Stack
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Frontend: HTML5 + Vanilla JavaScript                   │
+│    - MediaDevices.getUserMedia() (webcam access)        │
+│    - Canvas API (frame capture + render)                │
+│    - WebSocket API (binary streaming)                   │
+├─────────────────────────────────────────────────────────┤
+│  Backend: Python 3.11                                   │
+│    - FastAPI (async web framework)                      │
+│    - uvicorn (ASGI server)                              │
+│    - InsightFace 0.7.3 (face analysis)                 │
+│    - ONNX Runtime 1.20.1 (model inference)             │
+│    - OpenCV (image processing)                          │
+├─────────────────────────────────────────────────────────┤
+│  AI Models                                              │
+│    - SCRFD det_10g.onnx (face detection)               │
+│    - ArcFace w600k_r50.onnx (face recognition)         │
+│    - inswapper_128.onnx (face swap)                    │
+├─────────────────────────────────────────────────────────┤
+│  Infrastructure                                         │
+│    - Docker + Docker Compose                            │
+│    - Port 7777 (tránh OrbStack conflicts)              │
+│    - Named volume cho model cache                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+*License: InsightFace models — Non-commercial research use only.*
+*Sử dụng có trách nhiệm. Không dùng để tạo nội dung gây hiểu lầm.*

@@ -1,0 +1,15 @@
+*.mp4
+*.mov
+*.zip
+*.tar
+*.pth
+*.pt
+*.onnx
+*.ckpt
+*.safetensors
+models/
+weights/
+output/
+venv/
+node_modules/
+__pycache__/

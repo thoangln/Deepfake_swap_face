@@ -1,0 +1,55 @@
+# ============================================================
+# docker-compose.yml — Deepfake Face Swap Demo
+# Chạy: docker compose up --build
+# ============================================================
+
+services:
+  deepfake-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: deepfake-demo
+
+    ports:
+      # host_port:container_port
+      # Port 7777 tránh conflict với OrbStack (đang dùng 8000, 8080, 5000, 9000)
+      - "7777:7777"
+
+    volumes:
+      # Persist buffalo_l models (~400MB) qua các lần restart container
+      # Không cần download lại mỗi lần docker compose up
+      # Named volume 'insightface-models' được Docker quản lý tự động
+      - insightface-models:/root/.insightface
+
+      # Mount models/ folder từ host vào container (live update inswapper_128.onnx)
+      # Nếu thay file model mới, chỉ cần restart container, không cần rebuild image
+      - ./models:/app/models:ro
+
+    environment:
+      - PYTHONUNBUFFERED=1      # in log ra ngay, không buffer
+      - PYTHONDONTWRITEBYTECODE=1  # không tạo .pyc files
+
+    # Tự động restart nếu container crash (không restart khi user chủ động stop)
+    restart: unless-stopped
+
+    # Giới hạn tài nguyên — M1 Mac có 8-16GB unified memory
+    # Tăng memory_limit nếu cần load thêm model
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/status"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s   # buffalo_l cần ~60s load lần đầu trong container
+      retries: 3
+
+# Named volumes — Docker quản lý, persist qua các lần compose down/up
+volumes:
+  insightface-models:
+    driver: local
