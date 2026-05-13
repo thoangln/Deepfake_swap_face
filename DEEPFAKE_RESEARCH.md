@@ -1,412 +1,158 @@
-# Deepfake Research — Face Swap Demo
+# Deepfake Research: Chạm Ngõ AI Face Swap
 
-> Tài liệu cho buổi sharing nội bộ.
-> Demo: real-time face swap qua webcam trên browser, chạy hoàn toàn local.
-
----
-
-## Mục lục
-
-1. [Deepfake là gì?](#1-deepfake-là-gì)
-2. [Demo overview](#2-demo-overview)
-3. [Kiến trúc hệ thống](#3-kiến-trúc-hệ-thống)
-4. [Khái niệm cốt lõi](#4-khái-niệm-cốt-lõi)
-5. [AI Models](#5-ai-models)
-6. [Performance Profiling & Optimization](#6-performance-profiling--optimization)
-7. [Vấn đề & giải pháp](#7-vấn-đề--giải-pháp)
-8. [Tuneable Parameters](#8-tuneable-parameters)
-9. [Cách chạy](#9-cách-chạy)
-10. [Key Takeaways](#10-key-takeaways)
+> Dành cho buổi technical sharing. Tập trung vào các khái niệm cốt lõi, tư duy thiết kế hệ thống và bài học kỹ thuật khi tích hợp AI models vào ứng dụng thực tế. Tối giản code, nhấn mạnh vào flow và design.
 
 ---
 
-## 1. Deepfake là gì?
+## 1. Deepfake là gì? Góc nhìn tổng quan
+**Deepfake** là sự kết hợp giữa **Deep Learning** và **Fake** media, sử dụng mạng nề-ron nhân tạo để tổng hợp/thao túng hình ảnh, âm thanh, video sống động như thật.
 
-**Deepfake** = Deep Learning + Fake — dùng neural network tổng hợp media trông thật nhưng là giả.
-
-| Loại | Mô tả | Ví dụ |
-|---|---|---|
-| **Face Swap** | Thay mặt A lên video người B | ← *project này* |
-| **Face Reenactment** | Điều khiển biểu cảm theo video nguồn | First Order Motion |
-| **Voice Cloning** | Clone giọng nói từ vài giây audio | VALL-E, Bark |
+**Các phân nhánh phổ biến:**
+1. **Face Swap (Đổi mặt):** Lấy mặt của người A đắp lên người B trong video/ảnh (Phạm vi của project này).
+2. **Face Reenactment (Khắc họa biểu cảm):** Điều khiển cử chỉ miệng, mắt, đầu của một bức ảnh tĩnh theo video của người khác (First Order Motion).
+3. **Voice Cloning / Lip Sync:** Sao chép giọng nói chỉ từ vài giây audio mẫu và đồng bộ khẩu hình môi.
 
 ---
 
-## 2. Demo overview
+## 2. Nhập môn các thuật ngữ & Khái niệm cốt lõi
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                  http://localhost:7777                    │
-│                                                          │
-│  ┌───────────────────┐    ┌───────────────────┐         │
-│  │   Webcam gốc      │    │  Face Swap Output │         │
-│  │   (mirrored)      │    │  (realtime)       │         │
-│  └───────────────────┘    └───────────────────┘         │
-│                                                          │
-│  [📁 Upload Source Face]  [▶ Bắt đầu]  [■ Dừng]        │
-│                                                          │
-│  ⏱ Pipeline Timing Panel                                │
-│  (decode → detect → swap → encode)                      │
-└──────────────────────────────────────────────────────────┘
-```
+Khi tiếp cận quy trình tích hợp AI Deepfake, chúng ta sẽ bắt gặp các khái niệm sau:
 
-**Flow người dùng:**
-1. Mở browser → `localhost:7777`
-2. Upload ảnh có mặt người muốn swap sang (source face)
-3. Bấm "Bắt đầu Swap" → webcam bật, mặt trong webcam bị thay bằng source face
-
-**Chạy hoàn toàn local** — không gửi data ra internet, không cần GPU.
+*   **ONNX (Open Neural Network Exchange):** Được ví như "Docker Image dành cho AI". Nó là định dạng chuẩn giúp export model AI từ môi trường huấn luyện (PyTorch/TensorFlow) và dùng chung để chạy suy luận (Inference) trên đa dạng nền tảng phần cứng (CPU, GPU, Apple Neural Engine) mà không cần cài đặt lại môi trường gốc cồng kềnh.
+*   **Face Embedding (Latent Space):** Bản "DNA kỹ thuật số" của khuôn mặt. Mạng AI sẽ nén ảnh khuôn mặt thành một vector (ví dụ mảng 512 con số). Các số này mô tả cấu trúc tự nhiên (mắt, mũi, xương hàm) bất biến và độc lập với ánh sáng hay góc nghiêng.
+*   **Bounding Box & Landmarks:** Box là khung chữ nhật bao quanh một khuôn mặt. Landmarks là các điểm tọa độ chi tiết (mắt, mũi, khóe miệng) dùng để tính toán góc nghiêng và căn chỉnh mặt (Face Alignment).
+*   **Alpha Blending & ROI (Region of Interest):** Lớp phủ mềm làm mờ (Feather Mask) giúp trộn mượt viền khuôn mặt nhân tạo vào ảnh thật. Chỉ áp dụng tính toán hình ảnh tại đúng một vùng nhỏ (ROI) thay vì xử lý trên toàn bộ hình ảnh lớn để tiết kiệm tối đa tài nguyên.
 
 ---
 
-## 3. Kiến trúc hệ thống
+## 3. Kiến trúc Hệ thống & Luồng xử lý (Flows)
 
-### Tech Stack
+Dự án hỗ trợ hai luồng tương tác với người dùng với các mô hình quản lý process riêng biệt:
 
-```
-Frontend   │  HTML5 + Vanilla JS (Canvas API, WebSocket, getUserMedia)
-───────────┼──────────────────────────────────────────────────────────
-Backend    │  Python 3.11 · FastAPI · uvicorn (ASGI)
-           │  InsightFace 0.7.3 · ONNX Runtime 1.20.1 · OpenCV
-───────────┼──────────────────────────────────────────────────────────
-AI Models  │  SCRFD (detection) · ArcFace (embedding) · inswapper (swap)
-───────────┼──────────────────────────────────────────────────────────
-Infra      │  Docker + Docker Compose · Port 7777 · Named volume
-```
+### 3.1. Luồng Real-time Face Swap (Webcam)
+Đặc thù của luồng này là cần **Độ trễ rất thấp (Low Latency)**.
+*   **Giao thức:** Sử dụng **WebSocket** duy trì 1 kết nối liên tục, tránh overhead sinh header/connection tốn kém của HTTP khi truyền video ở tần số 10-20 FPS.
+*   **Backpressure Pattern (Request-Response Loop):** 
+    Thay vì bắt Client gửi liên tục, Client sẽ gửi frame 1 $\rightarrow$ Ném vào Executor xử lý song song $\rightarrow$ Server trả kết quả $\rightarrow$ Client vẽ lên UI xong MỚI gửi tiếp frame 2. Đảm bảo server không bao giờ bị nghẽn (backlog) làm tăng dồn latency.
 
-### System Flow
-
-```
- BROWSER                              FASTAPI SERVER
- ───────                              ──────────────
- Webcam getUserMedia()
-    │
-    ├─ Canvas capture (mirrored)
-    │  480×360, JPEG quality=0.55
-    │
-    ├──── WebSocket binary ──────────► receive_bytes()
-    │                                    │
-    │                                    ▼  run_in_executor
-    │                                 ┌─────────────────────┐
-    │                                 │   FaceSwapper        │
-    │                                 │   ① decode JPEG      │
-    │                                 │   ② SCRFD detect     │
-    │                                 │   ③ inswapper swap   │
-    │                                 │   ④ JPEG encode      │
-    │                                 └─────────────────────┘
-    │                                    │
-    ◄──── swapped JPEG binary ──────────┘
-    │
-    ├─ drawImage lên output canvas
-    └─ gửi frame tiếp (request-response loop)
-```
-
-### Source Face Setup (1 lần duy nhất)
-
-```
-Upload ảnh → SCRFD detect → ArcFace embedding [512-dim] → emap projection → lưu RAM (cached)
-```
+### 3.2. Luồng Video Batch Processing (File MP4)
+Đặc thù tốn cực kỳ nhiều thời gian xử lý từng khung hình, có thể gây đứt connection/timeout.
+*   **Giao thức:** **HTTP Polling** kết hợp Background Tasks.
+*   **Flow & Graceful Shutdown:**
+    1. Client nạp file video. Server cấp `job_id` và bắt tay xử lý ngầm (Background Task).
+    2. API `/video-status`: Trả về tiến độ hiện tại để Client tạo thanh Progress bar qua Polling.
+    3. Trạng thái Cancel (Dừng): Nếu Client bấm "Dừng", gọi API Cancel truyền tín hiệu Thread Event để ngắt ngầm process OpenCV an toàn, tránh waste CPU. Kết thúc sớm luồng chèn âm thanh (FFMPEG).
 
 ---
 
-## 4. Khái niệm cốt lõi
+## 4. Bóc tách AI Models (InsightFace)
 
-### 4.1 ONNX — "Docker Image cho AI Model"
+Hệ thống kết hợp nhiều model nhẹ chạy **hoàn toàn offline/local** để bảo vệ dữ liệu khuôn mặt:
 
-```
-PyTorch / TensorFlow  ─── export ───►  .onnx file (platform-agnostic)
-                                            │
-                                       ONNX Runtime (CPU / GPU / ANE)
-```
+1. **SCRFD (Face Detection):** Tìm khoanh vùng vị trí khuôn mặt. Cực kỳ nhanh, phù hợp quét camera real-time.
+2. **ArcFace (Face Recognition):** Trích xuất nhận diện (Face Embedding 512 số). Đặc biệt, khối lượng tính toán này chỉ dùng **1 lần duy nhất** khi người dùng tải ảnh đích lên, và lưu cache lại trên RAM (tránh tính lại thừa thãi).
+3. **INSwapper (Face Swap):** Mạng sinh nội dung thực hiện trích xuất mặt người và đắp đè đặc trưng nhận diện vào.
 
-Format trung gian chạy model AI trên bất kỳ hardware nào mà không cần framework gốc.
-
-### 4.2 Face Embedding — "DNA kỹ thuật số" của khuôn mặt
-
-```
-Khuôn mặt  ──►  ArcFace  ──►  [0.12, -0.87, 0.34, ..., 0.91]  (512 số)
-```
-
-- Hai mặt giống nhau → vector gần nhau (cosine similarity cao)
-- Nắm bắt đặc trưng bản chất (hình mắt, tỷ lệ mũi) **độc lập** góc độ, ánh sáng
-- `inswapper_128` dùng embedding để "in" đặc trưng source vào target, giữ nguyên pose/ánh sáng target
-
-### 4.3 WebSocket vs HTTP
-
-| | HTTP | WebSocket |
-|---|---|---|
-| Connection | Tạo mới mỗi request | 1 connection liên tục |
-| Overhead/frame | ~800 bytes header | ~2 bytes header |
-| Hướng | Client → Server | Full-duplex |
-
-Ở 10 FPS, HTTP tạo **600 connections/phút**. WebSocket giữ **1 connection** duy nhất.
-
-### 4.4 Backpressure — giữ latency cố định
-
-```
-❌ setInterval (gửi liên tục):           ✅ Request-Response:
-  t=0    gửi frame 1                       t=0    gửi frame 1
-  t=100  gửi frame 2 (server chưa xong)   t=200  nhận → gửi frame 2  (200ms)
-  t=200  gửi frame 3 → buffer tăng        t=400  nhận → gửi frame 3  (200ms)
-  → latency tăng vô hạn!                  → latency cố định ✓
-```
-
-Client chỉ gửi frame mới **sau khi nhận response** → không bao giờ tạo backlog.
-
-### 4.5 `run_in_executor` — async + CPU-bound
-
-```python
-# ❌ Block event loop → server đóng băng
-result = face_swapper.process_frame(frame_bytes)
-
-# ✅ Offload sang thread pool → event loop vẫn xử lý request khác
-result = await loop.run_in_executor(None, face_swapper.process_frame, frame_bytes)
-```
+> *Mẹo tối ưu Load:* Thư viện InsightFace sẽ mặc định load tất tần tật các thành phần như nhận diện Tuổi, Giới tính, 3D Mesh. Chủ động filter lược bỏ để chỉ nạp Detection + Recognition giúp rút ngắn **~40% thời gian** khởi động ứng dụng ban đầu.
 
 ---
 
-## 5. AI Models
+## 5. Cải thiện Hiệu năng thực chiến (Performance Optimizations)
 
-### Pipeline tổng quan
+Đây là các khía cạnh tốn chi phí rực rỡ nhất để đưa dự án từ chỗ "Swap chờ gãy cổ" thành "Swap Real-time mượt".
 
-```
-SOURCE (upload 1 lần):   SCRFD → ArcFace → embedding 512-dim → emap cache → RAM
+### 5.1. Bài toán Môi trường: Docker VM vs. Local Native 🔥 (BƯỚC NGOẶT)
+*   **Vấn đề:** Chạy hệ thống trên Docker ở Mac có độ trễ cực cao, FPS lẹt đẹt. Trong khi đó, phần cứng Mac (chip M-series) nổi tiếng mạnh mẽ.
+*   **Nguyên nhân:** Docker Desktop cấu trúc bên dưới trên Mac và Windows là chạy thông qua một máy ảo Linux (Linux VM). ONNX Runtime bị cô lập và chỉ thấy nhân CPU x86/ARM giả lập, **không thể tiếp cập Neural Engine (ANE)** hay GPU.
+*   **Giải pháp:** Gỡ Docker -> Setup môi trường **chạy Local trực tiếp qua Python ảo (venv)**. Lúc này, hệ thống kích hoạt thành công provider tăng tốc: **`CoreMLExecutionProvider` (Native Apple Silicon)**. Độ trễ tụt đáng kinh ngạc, xử lý khung hình siêu tốc và mở khóa mức FPS kỳ vọng.
 
-WEBCAM (mỗi frame):     SCRFD → face crop → inswapper(cached_latent, crop) → blend → output
-```
+### 5.2. Thuật toán Frame-skipping (Tiết kiệm xử lý)
+*   **Vấn đề:** Không phải khâu nào sinh ra cũng bắt buộc chạy trên định mức 100%. Model AI "Dò tìm mặt" (Detection) rất ngốn tài nguyên và không cần chạy mỗi milisecond (đầu người ít giật cục).
+*   **Giải pháp - Áp dụng Cơ chế Theo vết (Tracking) + Cache:** Chỉ yêu cầu tìm mặt **sau mỗi 5 khung hình**. Các khung hình liền kề ở giữa sử dụng tái lại kết quả tọa độ của box vừa detect, chỉ tịnh tiến rất ít. Kéo giảm mạnh mẽ mức tải lên CPU tổng thể hệ thống.
 
-### 5.1 SCRFD — Face Detection (`det_10g.onnx`)
-
-| | |
-|---|---|
-| **Nhiệm vụ** | Tìm vị trí khuôn mặt trong frame |
-| **Output** | Bounding box + 5 landmarks (mắt, mũi, miệng) |
-| **Input size** | Frame resize về 320×320 |
-| **Đặc điểm** | Nhanh hơn YOLO cho face, cân bằng tốc độ/accuracy |
-
-### 5.2 ArcFace — Face Recognition (`w600k_r50.onnx`)
-
-| | |
-|---|---|
-| **Nhiệm vụ** | Chuyển mặt thành vector 512 chiều |
-| **Input** | Ảnh mặt crop + align 112×112 |
-| **Training** | WebFace600K — 600K người, 5M ảnh |
-
-### 5.3 inswapper_128 — Face Swap (`inswapper_128.onnx`, ~500MB)
-
-| | |
-|---|---|
-| **Input** | Source latent (projected) + target face crop (128×128) |
-| **Output** | Swapped face (128×128) |
-| **Post-process** | Alpha blend kết quả vào frame gốc bằng soft mask |
-
-**Bên trong `INSwapper.get()`** (insightface source code):
-
-```
-① face_align.norm_crop2() → align target face → 128×128 crop
-② cv2.dnn.blobFromImage()  → NCHW float32 blob (/255)
-③ np.dot(embedding, emap)  → project source latent (chúng ta cache bước này)
-④ session.run()             → ONNX inference → swapped 128×128
-⑤ paste_back=True?
-   → 3× warpAffine full image
-   → erosion + dilation (morphological ops)
-   → 2× GaussianBlur full image
-   → float32 alpha blending toàn ảnh
-```
-
-> **Phát hiện quan trọng:** insightface document gọi step ⑤ là "Poisson blending"
-> nhưng đọc source code (`inswapper.py` line 60-101) cho thấy thực tế là
-> **alpha mask blending** (soft mask + `cv2.GaussianBlur`), không phải `cv2.seamlessClone`.
-
-### Models không dùng
-
-| Model | Mục đích | Lý do bỏ |
-|---|---|---|
-| `1k3d68.onnx` | 3D Landmark 68 điểm | Face swap không cần |
-| `2d106det.onnx` | 2D Landmark 106 điểm | Face swap không cần |
-| `genderage.onnx` | Đoán giới tính/tuổi | Không cần |
-
-→ `allowed_modules=["detection","recognition"]` bỏ 3/5 models, giảm **~40% thời gian load**.
+### 5.3. Custom Lightweight Blend (Cắt chi phí bọc gói)
+*   **Sự thật về thư viện mở:** Đọc sâu source code OpenCV của base model phát hiện các hàm ghép nối xử lý tràn lan làm mịn trên **Toàn khung hình 480x360 pixel** (Erosion, Dilation, Gaussian Blur) gây tụt giảm hiệu suất tàn bạo trên các thiết bị không có Card đồ họa mạnh.
+*   **Giải pháp (Bypass):** Chủ động can thiệp vào tham số chạy `paste_back=False`. Thay thế cơ chế mặc định bằng luồng tự tạo: tính toán cắt ghép **vừa khít trong vùng kích cỡ 128x128 pixel quanh khuôn mặt**, lưu bộ đệm các viền mờ (Feather Cache). Kết quả là nhả cả chục task dư thừa từ thư viện cho cấu hình phổ thông.
 
 ---
 
-## 6. Performance Profiling & Optimization
+## 6. Bài học kinh nghiệm Đắt giá (Key Takeways)
 
-### 6.1 Timing — phát hiện bottleneck
-
-Tích hợp `time.perf_counter()` vào 4 bước pipeline, rolling average 30 frames.
-
-**Kết quả đo ban đầu (Docker, CPU-only, M1 Mac, chưa optimize):**
-
-```
-┌──────────────────────┬────────────┬────────────┬────────┐
-│ Step                 │  Avg (ms)  │  Max (ms)  │   %    │
-├──────────────────────┼────────────┼────────────┼────────┤
-│ ① Decode + ColorConv │      0.6   │       2    │  0.03% │
-│ ② SCRFD Detection    │    265.1   │     396    │ 11.4%  │
-│ ③ inswapper + Blend  │  2,067.2   │   2,736    │ 88.5%  │ ← BOTTLENECK
-│ ④ Encode JPEG        │      1.0   │       9    │  0.04% │
-├──────────────────────┼────────────┼────────────┼────────┤
-│ TOTAL                │  2,333.9   │            │ 0.4 FPS│
-└──────────────────────┴────────────┴────────────┴────────┘
-```
-
-**Kết luận:** `inswapper + Blend` chiếm **88.5%** tổng thời gian → focus optimize step này.
-
-### 6.2 Phân tích insightface source code
-
-Đọc `insightface/model_zoo/inswapper.py` (101 dòng) → phát hiện `paste_back=True` chạy rất nhiều OpenCV operations trên full-image mỗi frame:
-
-```
-paste_back=True gồm:
-  ├── diff computation (float32 subtraction, abs, mean)
-  ├── cv2.invertAffineTransform
-  ├── 3× cv2.warpAffine trên full image (480×360 × 3 lần!)
-  ├── np.where + bbox calculation
-  ├── cv2.erode (kernel ~mask_size/10)
-  ├── cv2.dilate (kernel 2×2)
-  ├── 2× cv2.GaussianBlur trên full image
-  └── float32 alpha blending toàn ảnh
-```
-
-→ Nhiều operation thừa có thể thay thế bằng cách tự handle blending.
-
-### 6.3 Tối ưu đã áp dụng
-
-| # | Tối ưu | Chi tiết | Impact |
-|---|---|---|---|
-| 1 | **Custom lightweight blend** | Bypass `paste_back=True`. Dùng `paste_back=False` + 2× warpAffine + pre-computed soft mask + ROI-only blend | Giảm 6+ ops → 3 ops |
-| 2 | **Cache emap projection** | `np.dot(embedding, emap) + norm` tính 1 lần khi upload, không mỗi frame | ~1ms/frame |
-| 3 | **ONNX graph optimization** | `ORT_ENABLE_ALL` (constant folding, operator fusion, memory planning) | ~10-30% inference |
-| 4 | **Pre-computed blend mask** | Soft feathered mask 128×128 tạo 1 lần init, reuse mỗi frame | Bỏ erosion+dilation+blur |
-
-**So sánh trước/sau:**
-
-```
-TRƯỚC (insightface default):              SAU (custom):
-─────────────────────────────              ─────────────
-3× warpAffine full image                  1× warpAffine face 128×128 → full
-  + diff mask computation                 1× warpAffine pre-computed mask
-  + cv2.erode                             ROI-only alpha blend (chỉ vùng mặt ~150×150)
-  + cv2.dilate
-  + 2× GaussianBlur full image            → Bỏ: erosion, dilation, diff, blur,
-  + full-image alpha blend                   full-image operations
-```
-
-### 6.4 Giới hạn CPU
-
-ONNX neural net inference (`session.run()`) trên 128×128 input chiếm phần lớn step ③.
-Đây là **giới hạn phần cứng** — encoder-decoder 500MB trên CPU không thể nhanh hơn.
-
-| Hardware | Step ③ ước tính | FPS |
-|---|---|---|
-| CPU M1 (hiện tại) | ~300-500ms | 1-3 |
-| NVIDIA GPU (CUDA) | ~10-30ms | 15-30 |
-| NVIDIA GPU + TensorRT | ~5-15ms | 30-60 |
-
-→ Để realtime (>15 FPS), **bắt buộc cần GPU**.
-Trên CPU, tối ưu code-level chỉ cải thiện phần post-processing (~10-20% tổng).
+1. **Hiểu rõ giới hạn Tầng ảo hóa (Virtualized Environments):** Đừng vội vàng đổ lỗi do AI/Codebase khi dùng Docker mà thấy chậm. Rào cản truy cập phần cứng phân luồng cấp thấp (NPU/GPU/CoreML) từ bên trong Docker VM là vô cùng gian truân. Đối chiếu test Local là một quy trình bắt buộc trong ứng dụng AI thời gian thực.
+2. **Measure First, Optimize Later (Đo lường trước, Tối ưu sau):** Tránh Optimize bằng cảm tính. Thực thi việc cắm timing/Profiling cho 4 bước (Decode, Detect, Swap, Encode) đã dẫn lối thẳng đến bước Swap tốn lượng tài nguyên khổng lồ nhất (chiếm 80%) thay vì Detect.
+3. **Đừng tin mù quáng Framework (Bypass Defaults):** Tool mã nguồn mở được viết ra để có độ "bao phủ/trơn tru an toàn nhất", không phải "thời gian thực" nhất. Hiểu luồng rễ bên dưới cho phép lược bỏ tính toán dư là cách hệ thống bùng nổ hiệu năng.
+4. **Kiểm soát Graceful Shutdown:** Xử lý media lớn là bài toán Background Worker. Cần thiết kế tốt các tín hiệu hủy luồng an toàn (Event Signals) cho phép break các vòng lặp tính toán nặng giúp giải phóng RAM và tránh kẹp server treo triền miên.
 
 ---
 
-## 7. Vấn đề & giải pháp
+## 7. Setup System (TL;DR)
 
-| # | Vấn đề | Root Cause | Giải pháp |
-|---|---|---|---|
-| 1 | Docker build `g++ not found` | insightface compile Cython | `build-essential` trong Dockerfile |
-| 2 | `ml_dtypes` AttributeError | onnx 1.19 cần ml_dtypes≥0.5.0 | Pin `ml_dtypes>=0.5.0` |
-| 3 | CoreML `I/O error` trên M1 | buffalo_l opset không compatible | `CPUExecutionProvider` only |
-| 4 | Miss detect khi xoay mặt | `det_thresh=0.5` quá cao | `det_thresh=0.35` |
-| 5 | Output nhấp nháy | SCRFD miss 1-2 frame | Temporal smoothing `FALLBACK_FRAMES=6` |
-| 6 | Latency tăng dần | `setInterval` tạo WS backlog | Request-Response loop |
-| 7 | Server freeze | `process_frame()` block event loop | `run_in_executor` |
-| 8 | Ảnh bị đảo ngược | Webcam default selfie-mode | CSS `scaleX(-1)` + canvas mirror |
-| 9 | Docker no space | Docker disk cache đầy | `docker system prune -af` |
-| 10 | Swap 2s/frame | `paste_back=True`: 6+ OpenCV ops/frame | Custom lightweight blend |
-
----
-
-## 8. Tuneable Parameters
-
-| Thông số | Giá trị | Giảm → | Tăng → |
-|---|---|---|---|
-| `det_thresh` | 0.35 | Khó detect mặt | Nhiều false positive |
-| `det_size` | 320×320 | Nhanh hơn, miss mặt nhỏ | Chậm hơn, detect tốt hơn |
-| `FALLBACK_FRAMES` | 6 | Responsive khi mặt mất | Mượt khi xoay nhanh |
-| JPEG quality server | 80 | Nhỏ hơn, mờ hơn | Rõ hơn, to hơn |
-| Webcam resolution | 480×360 | Nhanh hơn | Chậm hơn, rõ hơn |
-| JPEG quality client | 0.55 | Latency thấp | Latency cao |
-| Docker memory | 4G | Có thể OOM | Tốn RAM host |
-
----
-
-## 9. Cách chạy
-
-### Docker (khuyến nghị)
-
+**Chạy Native trên hệ thống Local (Sử dụng CoreML - KHUYÊN DÙNG ĐỂ DEMO PERFORMANCE):**
 ```bash
-# Download inswapper_128.onnx → thư mục models/
-
-docker compose up --build -d    # Build & chạy
-open http://localhost:7777      # Mở browser
-
-docker compose logs -f          # Xem logs (có [PERF] timing)
-curl localhost:7777/metrics     # Xem timing JSON
-```
-
-### Local (Python 3.11+)
-
-```bash
-python -m venv venv && source venv/bin/activate
+# MacOS: Bắt buộc Python 3.11.x để tương thích mượt dependency ml-dtypes & numpy
+python3.11 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --host 127.0.0.1 --port 7777 --reload
+
+# Start Server
+uvicorn app.main:app --host 127.0.0.1 --port 7778 --reload
+# -> Truy cập: http://localhost:7778
 ```
 
-### Cấu trúc project
-
-```
-Deep fake research/
-├── app/
-│   ├── main.py           # FastAPI server + WebSocket
-│   └── face_swapper.py   # Face swap engine (optimized)
-├── static/
-│   └── index.html        # Frontend UI + metrics panel
-├── models/
-│   └── inswapper_128.onnx  # (~500MB, download thủ công)
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-└── DEEPFAKE_RESEARCH.md
+**Chạy hệ thống cấp Container (Docker - Fallback CPU):**
+```bash
+docker compose up --build -d
+# Cổng expose tại 7777 thay vì 7778
 ```
 
 ---
 
-## 10. Key Takeaways
+## 8. Chrome Extension — Face Swap trên Google Meet
 
-### AI/ML
-- **Model lớn ≠ tốt hơn** — `det_size=320` đủ cho webcam, nhanh 4x so với 640
-- **Chỉ load model cần thiết** — bỏ 3/5 sub-models → giảm 40%
-- **ONNX provider phải test thực tế** — "hardware hỗ trợ" ≠ "chạy được"
-- **Đọc source code thư viện** — insightface gọi "Poisson blend" nhưng thực tế là alpha mask. Hiểu internals mới optimize được
-- **Profile trước khi optimize** — timing cho thấy 88.5% ở swap, không phải detect/encode
+Mở rộng demo từ bản web sang **Chrome Extension** cho phép swap face trực tiếp trong cuộc gọi Google Meet.
 
-### Real-time Streaming
-- **Backpressure bắt buộc** cho mọi producer-consumer pipeline
-- **`run_in_executor`** = pattern chuẩn cho CPU-bound + async Python
-- **WebSocket >> HTTP** cho video streaming
+### 8.1. Kiến trúc Extension
 
-### Performance
-- **Đo trước, optimize sau** — đừng đoán bottleneck
-- **CPU có giới hạn cứng** — neural net inference cần GPU để realtime
-- **Post-processing tối ưu được** — pre-compute, cache, ROI-only
-- **Đừng wrap library blindly** — bypass default behavior khi cần
+```
+┌─────────────────────────────────────────────────────────┐
+│  Chrome Extension (MV3)                                 │
+│                                                         │
+│  ┌──────────┐    messages    ┌──────────────────────┐  │
+│  │  Popup   │ ◄────────────► │  Content Script      │  │
+│  │ (UI/UX)  │                │  (inject vào Meet)   │  │
+│  └──────────┘                └──────────┬───────────┘  │
+│                                         │               │
+│                              Override getUserMedia()    │
+│                              Hook RTCPeerConnection     │
+│                                         │               │
+└─────────────────────────────────────────┼───────────────┘
+                                          │ WebSocket
+                                          ▼
+                              ┌──────────────────────┐
+                              │  FastAPI Backend      │
+                              │  (local:7778)         │
+                              │  SCRFD → inswapper    │
+                              └──────────────────────┘
+```
 
-### Docker
-- `build-essential` cho Cython extensions
-- Named volume cho model cache
-- Monitor disk space khi làm AI models (~500MB+)
+### 8.2. Cơ chế hoạt động (Key Concepts)
 
----
+1. **Override `getUserMedia()`:** Content script chạy ở `document_start`, ghi đè hàm lấy webcam TRƯỚC khi Google Meet gọi. Khi Meet yêu cầu camera → ta vẫn lấy stream thật nhưng trả về một stream giả (canvas).
+2. **Hook `RTCPeerConnection.addTrack()`:** Bắt tất cả video sender của WebRTC, dùng `sender.replaceTrack()` để thay video track thật bằng canvas track đã swap.
+3. **Canvas Pipeline:** Webcam thật → hidden `<video>` → capture lên `<canvas>` → gửi qua WebSocket → nhận frame đã swap → vẽ lại lên canvas → `captureStream()` trả cho Meet.
+4. **Backpressure giữ nguyên:** Cùng mô hình Request-Response — chỉ gửi frame mới sau khi nhận response từ server.
 
-*License: InsightFace models — Non-commercial research use only.*
-*Sử dụng có trách nhiệm. Không dùng để tạo nội dung gây hiểu lầm.*
+### 8.3. Cách cài đặt & sử dụng
+
+```bash
+# 1. Chạy backend server (bắt buộc)
+source venv/bin/activate
+uvicorn app.main:app --host 127.0.0.1 --port 7778 --reload
+
+# 2. Load extension vào Chrome
+#    → chrome://extensions → Bật "Developer mode"
+#    → "Load unpacked" → chọn thư mục chrome-extension/
+
+# 3. Mở Google Meet → Click icon extension
+#    → Upload source face → Bấm "Bắt đầu Swap"
+```

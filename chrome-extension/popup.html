@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 340px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 15px;
+      text-align: center;
+      margin-bottom: 12px;
+      color: #00d2ff;
+    }
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: #16213e;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      font-size: 12px;
+    }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #ff4444;
+      flex-shrink: 0;
+    }
+    .status-dot.connected { background: #00e676; }
+    .status-dot.swapping  { background: #ffab00; animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: 0.4; } }
+
+    .section {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #888;
+      margin-bottom: 8px;
+    }
+
+    .server-input {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .server-input input {
+      flex: 1;
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid #333;
+      background: #0f0f23;
+      color: #e0e0e0;
+      font-size: 12px;
+      outline: none;
+    }
+    .server-input input:focus { border-color: #00d2ff; }
+
+    .upload-zone {
+      border: 2px dashed #333;
+      border-radius: 8px;
+      padding: 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s;
+      position: relative;
+    }
+    .upload-zone:hover { border-color: #00d2ff; }
+    .upload-zone.has-face { border-color: #00e676; border-style: solid; }
+    .upload-zone input { display: none; }
+    .upload-zone .label { font-size: 13px; color: #aaa; }
+    .upload-zone .label .icon { font-size: 24px; display: block; margin-bottom: 4px; }
+    .upload-zone.has-face .label { color: #00e676; }
+
+    .preview-img {
+      width: 60px; height: 60px;
+      border-radius: 50%;
+      object-fit: cover;
+      border: 2px solid #00e676;
+      display: none;
+      margin: 0 auto 8px;
+    }
+    .preview-img.show { display: block; }
+
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    button {
+      flex: 1;
+      padding: 10px 0;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    #btnStart {
+      background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+      color: #fff;
+    }
+    #btnStart:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,210,255,0.3); }
+    #btnStop {
+      background: #ff4444;
+      color: #fff;
+    }
+    #btnStop:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(255,68,68,0.3); }
+
+    .metrics {
+      font-size: 11px;
+      color: #888;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px 12px;
+    }
+    .metrics span { color: #00d2ff; font-weight: 600; }
+
+    .footer {
+      text-align: center;
+      font-size: 10px;
+      color: #555;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>🎭 Face Swap — Google Meet</h1>
+
+  <!-- Server connection -->
+  <div class="status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Chưa kết nối server</span>
+  </div>
+
+  <!-- Backend URL -->
+  <div class="section">
+    <div class="section-title">🖥 Backend Server</div>
+    <div class="server-input">
+      <input type="text" id="serverUrl" value="http://127.0.0.1:7778" placeholder="http://127.0.0.1:7778">
+      <button style="flex:0; padding:6px 12px; font-size:11px; background:#333; color:#fff; border-radius:6px;" id="btnConnect">Kết nối</button>
+    </div>
+  </div>
+
+  <!-- Source face upload -->
+  <div class="section">
+    <div class="section-title">📸 Source Face</div>
+    <img class="preview-img" id="facePreview" alt="preview">
+    <div class="upload-zone" id="uploadZone">
+      <input type="file" id="fileInput" accept="image/*">
+      <div class="label">
+        <span class="icon">📁</span>
+        Click để chọn ảnh khuôn mặt
+      </div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="btn-row">
+    <button id="btnStart" disabled>▶ Bắt đầu Swap</button>
+    <button id="btnStop" disabled>⛔ Dừng</button>
+  </div>
+
+  <!-- Metrics -->
+  <div class="section" style="margin-top:10px;">
+    <div class="section-title">📊 Performance</div>
+    <div class="metrics">
+      <div>FPS: <span id="metricFps">—</span></div>
+      <div>Latency: <span id="metricLatency">—</span></div>
+      <div>Detect: <span id="metricDetect">—</span></div>
+      <div>Swap: <span id="metricSwap">—</span></div>
+    </div>
+  </div>
+
+  <div class="footer">⚠ Chỉ dùng cho mục đích nghiên cứu. Server chạy local.</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

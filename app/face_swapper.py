@@ -40,9 +40,17 @@ class FaceSwapper:
         sess_opts.intra_op_num_threads = 0   # auto-detect (M1: 8 cores)
         sess_opts.inter_op_num_threads = 1   # sequential node execution
 
+        # Thử CoreMLExecutionProvider (M1 ANE/GPU, macOS local chỉ — Docker Linux tự bỏ qua)
+        # Nếu CoreML không khả dụng, ORT tự fallback sang CPUExecutionProvider
+        swap_providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
         self._swap_session = onnxruntime.InferenceSession(
-            model_path, sess_opts, providers=providers
+            model_path, sess_opts, providers=swap_providers
         )
+        _active = self._swap_session.get_providers()
+        if "CoreMLExecutionProvider" in _active:
+            print("[INFO] inswapper: dùng CoreMLExecutionProvider (M1 ANE/GPU) ✓")
+        else:
+            print("[INFO] inswapper: CPUExecutionProvider (CoreML không khả dụng hoặc đang trong Docker)")
         self._input_names = [inp.name for inp in self._swap_session.get_inputs()]
         self._output_names = [out.name for out in self._swap_session.get_outputs()]
 
@@ -63,6 +71,12 @@ class FaceSwapper:
         self._last_swapped: bytes | None = None
         self._no_face_streak: int = 0
         self.FALLBACK_FRAMES: int = 6
+
+        # Frame-skip detection: chỉ chạy SCRFD mỗi N frame, các frame giữa dùng cache
+        # → Tiết kiệm ~265ms × (N-1)/N mỗi frame trung bình trên CPU
+        self.DETECT_INTERVAL: int = 5   # Chạy SCRFD full detection mỗi 5 frame
+        self._detect_frame_idx: int = 0
+        self._cached_faces: list = []   # Cache kết quả SCRFD gần nhất
 
         # --- Timing metrics (rolling window 30 frames) ---
         _w = 30
@@ -200,8 +214,22 @@ class FaceSwapper:
 
         t1 = time.perf_counter()
 
-        # ── Step 2: SCRFD Face Detection ─────────────────────────────────────
-        target_faces = self.face_analyzer.get(frame_rgb)
+        # ── Step 2: SCRFD Face Detection (với Frame-Skip) ────────────────────
+        # Chỉ chạy detection đầy đủ mỗi DETECT_INTERVAL frame.
+        # Các frame ở giữa reuse cached_faces từ lần detect trước:
+        #   - Nếu mặt không di chuyển nhiều (< 1/10 frame interval ≈ 30ms), sai số rất nhỏ
+        #   - Khi cache rỗng (chưa có face), force detect ngay
+        self._detect_frame_idx += 1
+        run_detection = (
+            self._detect_frame_idx % self.DETECT_INTERVAL == 1
+            or len(self._cached_faces) == 0
+        )
+
+        if run_detection:
+            target_faces = self.face_analyzer.get(frame_rgb)
+            self._cached_faces = target_faces
+        else:
+            target_faces = self._cached_faces
 
         t2 = time.perf_counter()
 

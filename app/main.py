@@ -23,6 +23,7 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.face_swapper import FaceSwapper
 
@@ -47,6 +48,15 @@ print("[INFO] Face Swap Engine ready!")
 
 # --- FastAPI App ---
 app = FastAPI(title="Deepfake Web Demo", version="1.0.0")
+
+# CORS — cho phép Chrome Extension (chrome-extension://*) và local dev gọi API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Mount thư mục static/ để serve HTML/CSS/JS
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
