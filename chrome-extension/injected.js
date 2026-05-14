@@ -30,9 +30,9 @@
   let renderRAF     = null;
   let proxyReady    = false;
 
-  const CANVAS_W    = 640;
-  const CANVAS_H    = 480;
-  const JPEG_QUALITY = 0.88; // tăng chất lượng JPEG
+  const CANVAS_W    = 1080;
+  const CANVAS_H    = 720;
+  const JPEG_QUALITY = 0.88;
 
   // ══════════════════════════════════════════════════════════════════════════
   //  Override getUserMedia — chạy trong MAIN WORLD nên thật sự override được
@@ -40,7 +40,14 @@
   const _orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
 
   navigator.mediaDevices.getUserMedia = async function (constraints) {
-    const stream = await _orig(constraints);
+    // Force 4:3 aspect ratio để tránh distortion khi vẽ vào 480×360 canvas
+    // Meet request 1280×720 (16:9) → nếu không override → face bị squish → embedding sai
+    const modifiedConstraints = JSON.parse(JSON.stringify(constraints || {}));
+    if (modifiedConstraints.video && modifiedConstraints.video !== false) {
+      const vc = typeof modifiedConstraints.video === "object" ? modifiedConstraints.video : {};
+      modifiedConstraints.video = { ...vc, width: { ideal: 480 }, height: { ideal: 360 }, frameRate: { ideal: 15 } };
+    }
+    const stream = await _orig(modifiedConstraints);
     if (!constraints?.video) return stream;
 
     console.log("[FaceSwap injected] getUserMedia intercepted ✓");

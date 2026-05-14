@@ -206,9 +206,9 @@ class FaceSwapper:
             return None
 
         h, w = frame.shape[:2]
-        if w > 480:
-            scale = 480 / w
-            frame = cv2.resize(frame, (480, int(h * scale)), interpolation=cv2.INTER_LINEAR)
+        if w > 640:
+            scale = 640 / w
+            frame = cv2.resize(frame, (640, int(h * scale)), interpolation=cv2.INTER_LINEAR)
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -238,7 +238,7 @@ class FaceSwapper:
                 self._no_face_streak += 1
                 if self._last_swapped is not None and self._no_face_streak <= self.FALLBACK_FRAMES:
                     return self._last_swapped
-            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
             return buf.tobytes()
 
         # ── Step 3: Optimized Face Swap ──────────────────────────────────────
@@ -250,7 +250,7 @@ class FaceSwapper:
 
         # ── Step 4: Color convert + JPEG Encode ──────────────────────────────
         result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
-        _, buf = cv2.imencode(".jpg", result_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        _, buf = cv2.imencode(".jpg", result_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
         result_bytes = buf.tobytes()
 
         t4 = time.perf_counter()
