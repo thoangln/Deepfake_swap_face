@@ -11,7 +11,7 @@ chrome.runtime.onInstalled.addListener(() => {
   // Set default server URL
   chrome.storage.local.get("serverUrl", (data) => {
     if (!data.serverUrl) {
-      chrome.storage.local.set({ serverUrl: "http://127.0.0.1:7778" });
+      chrome.storage.local.set({ serverUrl: "http://127.0.0.1:3636" });
     }
   });
 });

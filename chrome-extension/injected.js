@@ -29,9 +29,10 @@
   let lastSwappedImg = null;
   let renderRAF     = null;
   let proxyReady    = false;
+  let proxySetupPromise = null;  // guard chống concurrent setupProxy
 
-  const CANVAS_W    = 1080;
-  const CANVAS_H    = 720;
+  let CANVAS_W    = 1280;  // sẽ cập nhật theo resolution thật của camera
+  let CANVAS_H    = 720;
   const JPEG_QUALITY = 0.88;
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -40,64 +41,116 @@
   const _orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
 
   navigator.mediaDevices.getUserMedia = async function (constraints) {
-    // Force 4:3 aspect ratio để tránh distortion khi vẽ vào 480×360 canvas
-    // Meet request 1280×720 (16:9) → nếu không override → face bị squish → embedding sai
-    const modifiedConstraints = JSON.parse(JSON.stringify(constraints || {}));
-    if (modifiedConstraints.video && modifiedConstraints.video !== false) {
-      const vc = typeof modifiedConstraints.video === "object" ? modifiedConstraints.video : {};
-      modifiedConstraints.video = { ...vc, width: { ideal: 480 }, height: { ideal: 360 }, frameRate: { ideal: 15 } };
-    }
-    const stream = await _orig(modifiedConstraints);
+    // KHÔNG override constraints — để camera chạy resolution tự nhiên
+    const stream = await _orig(constraints || {});
     if (!constraints?.video) return stream;
 
     console.log("[FaceSwap injected] getUserMedia intercepted ✓");
-    await setupProxy(stream);
-    return buildMixedStream(stream);
+    try {
+      await setupProxy(stream);
+      return buildMixedStream(stream);
+    } catch (e) {
+      // Fallback: proxy thất bại → trả stream thật để Meet vẫn có camera (không face swap)
+      console.warn("[FaceSwap injected] Proxy failed, fallback raw stream:", e);
+      return stream;
+    }
   };
+  // Cũng override prototype → bắt mọi call pattern (Workspace Meet có thể dùng prototype trực tiếp)
+  MediaDevices.prototype.getUserMedia = navigator.mediaDevices.getUserMedia;
 
   // ══════════════════════════════════════════════════════════════════════════
   //  Setup proxy pipeline (1 lần duy nhất)
   // ══════════════════════════════════════════════════════════════════════════
   async function setupProxy(realStream) {
     if (proxyReady) {
-      // Update real stream source nếu stream đổi
       if (realVideo) {
         realVideo.srcObject = realStream;
-        await realVideo.play().catch(() => {});
+        realVideo.play().catch(() => {});
       }
       return;
     }
+    // Concurrency guard: Meet gọi getUserMedia nhiều lần → chỉ chạy setup 1 lần
+    // Không có guard → 2 setupProxy chạy song song → conflict realVideo/outputCanvas
+    if (proxySetupPromise) { await proxySetupPromise; return; }
+    let _done;
+    proxySetupPromise = new Promise(r => _done = r);
 
-    // Hidden video đọc webcam thật
-    realVideo = document.createElement("video");
-    realVideo.setAttribute("autoplay", "");
-    realVideo.setAttribute("playsinline", "");
-    realVideo.setAttribute("muted", "");
-    realVideo.style.cssText = "position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;";
-    document.documentElement.appendChild(realVideo);
-    realVideo.srcObject = realStream;
-    await realVideo.play().catch((e) => console.warn("[FaceSwap injected] video.play:", e));
+    try {
+      // Hidden video đọc webcam thật
+      realVideo = document.createElement("video");
+      realVideo.setAttribute("autoplay", "");
+      realVideo.setAttribute("playsinline", "");
+      realVideo.setAttribute("muted", "");
+      realVideo.style.cssText = "position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;";
+      document.documentElement.appendChild(realVideo);
+      realVideo.srcObject = realStream;
+      realVideo.play().catch((e) => console.warn("[FaceSwap injected] video.play:", e));
 
-    // Output canvas → Meet nhận stream này
-    outputCanvas = document.createElement("canvas");
-    outputCanvas.width  = CANVAS_W;
-    outputCanvas.height = CANVAS_H;
-    outputCanvas.style.cssText = "position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;";
-    document.documentElement.appendChild(outputCanvas);
-    outputCtx = outputCanvas.getContext("2d");
+      // Output canvas → Meet nhận stream này (default 1280×720)
+      outputCanvas = document.createElement("canvas");
+      outputCanvas.width  = CANVAS_W;
+      outputCanvas.height = CANVAS_H;
+      outputCanvas.style.cssText = "position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;";
+      document.documentElement.appendChild(outputCanvas);
+      outputCtx = outputCanvas.getContext("2d");
 
-    // Capture canvas (gửi WS)
-    captureCanvas = document.createElement("canvas");
-    captureCanvas.width  = CANVAS_W;
-    captureCanvas.height = CANVAS_H;
-    captureCtx = captureCanvas.getContext("2d");
+      // Capture canvas (gửi WS)
+      captureCanvas = document.createElement("canvas");
+      captureCanvas.width  = CANVAS_W;
+      captureCanvas.height = CANVAS_H;
+      captureCtx = captureCanvas.getContext("2d");
 
-    outputStream = outputCanvas.captureStream(30);
-    proxyReady = true;
+      // Tạo stream NGAY — KHÔNG chờ canplay
+      // Nếu await canplay (1500ms) → getUserMedia block quá lâu → Workspace Meet timeout → camera fail
+      outputStream = outputCanvas.captureStream(30);
 
-    startRenderLoop();
-    console.log("[FaceSwap injected] Proxy pipeline ready", CANVAS_W + "x" + CANVAS_H);
-    postToContent("PROXY_READY", {});
+      // Spoof canvas track → trông như camera thật
+      // Workspace Meet kiểm tra track.label + getSettings() + getCapabilities() để validate
+      const realTrack   = realStream.getVideoTracks()[0];
+      const canvasTrack = outputStream.getVideoTracks()[0];
+      if (realTrack && canvasTrack) {
+        const rs = realTrack.getSettings();
+        canvasTrack.getSettings    = () => ({ ...rs, width: CANVAS_W, height: CANVAS_H });
+        canvasTrack.getCapabilities = realTrack.getCapabilities
+          ? () => realTrack.getCapabilities()
+          : canvasTrack.getCapabilities;
+        try {
+          Object.defineProperty(canvasTrack, "label",
+            { get: () => realTrack.label, configurable: true });
+        } catch (_) {}
+      }
+
+      proxyReady = true;
+      startRenderLoop();
+      console.log("[FaceSwap injected] Proxy pipeline ready", CANVAS_W + "x" + CANVAS_H);
+      postToContent("PROXY_READY", {});
+
+      // Async (không block): điều chỉnh kích thước canvas khi video thật có data
+      // Render loop sẽ tự vẽ frame khi readyState >= 2
+      new Promise((resolve) => {
+        if (realVideo.readyState >= 2) { resolve(); return; }
+        realVideo.addEventListener("canplay", resolve, { once: true });
+        setTimeout(resolve, 3000);
+      }).then(() => {
+        const vw = realVideo.videoWidth;
+        const vh = realVideo.videoHeight;
+        if (vw && vh && (vw !== CANVAS_W || vh !== CANVAS_H)) {
+          CANVAS_W = vw; CANVAS_H = vh;
+          outputCanvas.width  = vw; outputCanvas.height  = vh;
+          captureCanvas.width = vw; captureCanvas.height = vh;
+          if (realTrack && canvasTrack) {
+            const rs2 = realTrack.getSettings();
+            canvasTrack.getSettings = () => ({ ...rs2, width: CANVAS_W, height: CANVAS_H });
+          }
+        }
+        if (realVideo.readyState >= 2) {
+          outputCtx.drawImage(realVideo, 0, 0, CANVAS_W, CANVAS_H);
+        }
+      });
+
+    } finally {
+      _done();
+    }
   }
 
   function buildMixedStream(realStream) {

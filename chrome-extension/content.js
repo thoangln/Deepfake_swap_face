@@ -13,14 +13,14 @@
   "use strict";
 
   // ── 1. Inject script vào MAIN WORLD ──
-  const script = document.createElement("script");
-  script.src = chrome.runtime.getURL("injected.js");
-  script.onload = () => {
-    console.log("[FaceSwap bridge] injected.js loaded into main world ✓");
-    script.remove();
-  };
-  script.onerror = (e) => console.error("[FaceSwap bridge] Failed to inject:", e);
-  (document.head || document.documentElement).appendChild(script);
+  // const script = document.createElement("script");
+  // script.src = chrome.runtime.getURL("injected.js");
+  // script.onload = () => {
+  //   console.log("[FaceSwap bridge] injected.js loaded into main world ✓");
+  //   script.remove();
+  // };
+  // script.onerror = (e) => console.error("[FaceSwap bridge] Failed to inject:", e);
+  // (document.head || document.documentElement).appendChild(script);
 
   // ── 2. Relay: injected.js → chrome.runtime (popup) ──
   window.addEventListener("__faceswap_to_content__", (e) => {

@@ -5,7 +5,7 @@
 ---
 
 ## 1. Deepfake là gì? Góc nhìn tổng quan
-**Deepfake** là sự kết hợp giữa **Deep Learning** và **Fake** media, sử dụng mạng nề-ron nhân tạo để tổng hợp/thao túng hình ảnh, âm thanh, video sống động như thật.
+**Deepfake** là sự kết hợp giữa **Deep Learning** và **Fake** media, sử dụng mạng neural nhân tạo để tổng hợp/thao túng hình ảnh, âm thanh, video sống động như thật.
 
 **Các phân nhánh phổ biến:**
 1. **Face Swap (Đổi mặt):** Lấy mặt của người A đắp lên người B trong video/ảnh (Phạm vi của project này).
@@ -25,15 +25,113 @@ Khi tiếp cận quy trình tích hợp AI Deepfake, chúng ta sẽ bắt gặp 
 
 ---
 
-## 3. Kiến trúc Hệ thống & Luồng xử lý (Flows)
+## 3. Cơ chế AI: Từ mặt A sang mặt B
 
-Dự án hỗ trợ hai luồng tương tác với người dùng với các mô hình quản lý process riêng biệt:
+Đây là phần cốt lõi nhất. Toàn bộ pipeline gồm **4 bước tuần tự**, thực hiện mỗi frame webcam:
 
-### 3.1. Luồng Real-time Face Swap (Webcam)
-Đặc thù của luồng này là cần **Độ trễ rất thấp (Low Latency)**.
-*   **Giao thức:** Sử dụng **WebSocket** duy trì 1 kết nối liên tục, tránh overhead sinh header/connection tốn kém của HTTP khi truyền video ở tần số 10-20 FPS.
-*   **Backpressure Pattern (Request-Response Loop):** 
-    Thay vì bắt Client gửi liên tục, Client sẽ gửi frame 1 $\rightarrow$ Ném vào Executor xử lý song song $\rightarrow$ Server trả kết quả $\rightarrow$ Client vẽ lên UI xong MỚI gửi tiếp frame 2. Đảm bảo server không bao giờ bị nghẽn (backlog) làm tăng dồn latency.
+### 3.1. Bước 1 — Source Face Encoding (thực hiện 1 lần duy nhất)
+
+Khi người dùng upload ảnh mặt nguồn (người A), hệ thống cần trích xuất "danh tính" của khuôn mặt đó thành dạng toán học:
+
+1. **SCRFD phát hiện mặt** trong ảnh, trả về 5 landmark points (2 mắt, mũi, 2 khóe miệng).
+2. **Face Alignment:** Dựa vào 5 điểm đó, tính ma trận biến đổi affine để chuẩn hóa khuôn mặt về **128×128 pixel** — chuẩn "ảnh hộ chiếu" thẳng nhìn thẳng, bất kể góc nghiêng ban đầu.
+3. **ArcFace mã hóa** ảnh đã chuẩn hóa thành **vector 512 chiều** — đây là "DNA kỹ thuật số" của mặt A. Vector này mô tả cấu trúc xương hàm, khoảng cách mắt, đường nét mũi... bất biến với ánh sáng hay góc nghiêng.
+4. **Cache lại vector đó.** Bước 1 chỉ chạy 1 lần khi upload, không lặp lại mỗi frame.
+
+```
+Ảnh mặt A  →  SCRFD (detect)  →  Face Align 128×128  →  ArcFace  →  vector[512]  →  Cache RAM
+```
+
+### 3.2. Bước 2 — Target Face Alignment (mỗi frame)
+
+Với mỗi frame webcam (người B đang ngồi trước camera):
+
+1. **SCRFD quét frame** để tìm vị trí khuôn mặt B, lấy 5 landmarks.
+2. **Tính ma trận affine M** để cắt và chuẩn hóa mặt B → **128×128** (cùng chuẩn với bước 1).
+3. **Lưu lại ma trận M** để dùng ở bước 4 (warp ngược).
+
+```
+Frame webcam B  →  SCRFD  →  5 landmarks  →  Affine Matrix M  →  Crop 128×128 chuẩn hóa
+```
+
+### 3.3. Bước 3 — INSwapper: Sinh khuôn mặt mới (trọng tâm)
+
+Đây là model AI quan trọng nhất. INSwapper là một **mạng sinh ảnh có điều kiện** (conditional generative network):
+
+*   **Đầu vào:** Ảnh 128×128 của mặt B (đã chuẩn hóa) + vector identity[512] của mặt A
+*   **Đầu ra:** Ảnh 128×128 — khuôn mặt **mang danh tính A** nhưng giữ nguyên **pose, biểu cảm, góc nhìn của B**
+
+> **Analogy:** Hãy tưởng tượng một diễn viên (B) đang đeo một chiếc mặt nạ được đúc hoàn hảo theo khuôn mặt A — nhưng mặt nạ đó vẫn nhếch miệng cười, nhíu mày, hay quay đầu theo đúng chuyển động của diễn viên.
+
+INSwapper không "copy-paste" pixel của mặt A. Nó **học cách tái tạo lại mặt A** từ vector identity, sau đó áp dụng vào hình dạng/góc của mặt B.
+
+```
+     ┌─── identity vector[512] (mặt A) ────────────┐
+     │                                              ▼
+Mặt B 128×128  ──────────────────────────►  INSwapper  ──►  Mặt mới 128×128
+(pose/expression của B)                              (identity của A, pose của B)
+```
+
+### 3.4. Bước 4 — Warp ngược + Alpha Blend
+
+Mặt mới 128×128 cần được dán trở lại đúng vị trí trên frame gốc:
+
+1. **Inverse Affine M⁻¹:** Biến đổi ngược lại để đưa ảnh 128×128 về đúng kích thước, góc, vị trí trong frame.
+2. **Feather Mask (Alpha Blend):** Dùng mask gradient mờ dần ở rìa để hoà tan mượt viền mặt mới vào nền ảnh thật. Không có viền cứng.
+3. **Blend chỉ trong ROI** (vùng nhỏ quanh mặt), không xử lý toàn khung hình.
+
+```
+Mặt mới 128×128  →  Warp M⁻¹  →  Blend với Feather Mask  →  Frame output
+```
+
+### 3.5. Sơ đồ tổng thể pipeline
+
+```mermaid
+flowchart TD
+    subgraph ONCE ["1 lần khi upload"]
+        A1[Ảnh mặt A] --> B1[SCRFD detect]
+        B1 --> C1[Face Align 128×128]
+        C1 --> D1[ArcFace]
+        D1 --> E1["Identity vector 512d"]
+        E1 --> F1[Cache RAM]
+    end
+
+    subgraph FRAME ["Mỗi frame webcam"]
+        A2[Frame webcam B] --> B2[SCRFD detect]
+        B2 --> C2["5 landmarks + Ma trận M"]
+        C2 --> D2[Crop & Align 128×128]
+
+        D2 --> E2[INSwapper]
+        F1 --> E2
+        E2 --> F2["Mặt mới: identity A + pose B"]
+
+        F2 --> G2["Warp ngược M⁻¹"]
+        G2 --> H2[Alpha Blend Feather Mask]
+        A2 --> H2
+        H2 --> I2[Frame output]
+    end
+```
+
+---
+
+## 4. Bóc tách AI Models (InsightFace)
+
+Hệ thống kết hợp nhiều model nhẹ chạy **hoàn toàn offline/local** để bảo vệ dữ liệu khuôn mặt:
+
+1. **SCRFD (Face Detection):** Tìm vị trí khuôn mặt và 5 landmark points. Cực kỳ nhanh, phù hợp quét camera real-time.
+2. **ArcFace (Face Recognition):** Trích xuất Face Embedding 512 chiều. Chỉ tính **1 lần khi upload source face**, cache lại RAM.
+3. **INSwapper (Face Swap):** Mạng sinh ảnh có điều kiện — nhận identity embedding + aligned face → sinh khuôn mặt mới.
+
+> *Mẹo tối ưu Load:* InsightFace mặc định load thêm cả nhận diện Tuổi, Giới tính, 3D Mesh. Chủ động filter chỉ nạp Detection + Recognition giúp giảm **~40% thời gian** khởi động.
+
+---
+
+## 5. Kiến trúc Hệ thống & Luồng xử lý
+
+Dự án hỗ trợ hai luồng với mô hình giao tiếp khác nhau:
+
+### 5.1. Luồng Real-time (Webcam)
+**WebSocket** duy trì kết nối liên tục, client chỉ gửi frame mới sau khi nhận response — tránh queue tích lũy latency.
 
 **Sơ đồ flow Real-time (WebSocket + Backpressure):**
 
@@ -51,13 +149,8 @@ flowchart LR
     J -->|Chi gui khi da nhan response| A
 ```
 
-### 3.2. Luồng Video Batch Processing (File MP4)
-Đặc thù tốn cực kỳ nhiều thời gian xử lý từng khung hình, có thể gây đứt connection/timeout.
-*   **Giao thức:** **HTTP Polling** kết hợp Background Tasks.
-*   **Flow & Graceful Shutdown:**
-    1. Client nạp file video. Server cấp `job_id` và bắt tay xử lý ngầm (Background Task).
-    2. API `/video-status`: Trả về tiến độ hiện tại để Client tạo thanh Progress bar qua Polling.
-    3. Trạng thái Cancel (Dừng): Nếu Client bấm "Dừng", gọi API Cancel truyền tín hiệu Thread Event để ngắt ngầm process OpenCV an toàn, tránh waste CPU. Kết thúc sớm luồng chèn âm thanh (FFMPEG).
+### 5.2. Luồng Video Batch (File MP4)
+**HTTP Polling** + Background Task để tránh timeout. Server cấp `job_id`, client poll tiến độ, hỗ trợ cancel an toàn.
 
 **Sơ đồ flow Video Batch (HTTP Polling + Cancel Signal):**
 
@@ -84,19 +177,7 @@ flowchart TD
 
 ---
 
-## 4. Bóc tách AI Models (InsightFace)
-
-Hệ thống kết hợp nhiều model nhẹ chạy **hoàn toàn offline/local** để bảo vệ dữ liệu khuôn mặt:
-
-1. **SCRFD (Face Detection):** Tìm khoanh vùng vị trí khuôn mặt. Cực kỳ nhanh, phù hợp quét camera real-time.
-2. **ArcFace (Face Recognition):** Trích xuất nhận diện (Face Embedding 512 số). Đặc biệt, khối lượng tính toán này chỉ dùng **1 lần duy nhất** khi người dùng tải ảnh đích lên, và lưu cache lại trên RAM (tránh tính lại thừa thãi).
-3. **INSwapper (Face Swap):** Mạng sinh nội dung thực hiện trích xuất mặt người và đắp đè đặc trưng nhận diện vào.
-
-> *Mẹo tối ưu Load:* Thư viện InsightFace sẽ mặc định load tất tần tật các thành phần như nhận diện Tuổi, Giới tính, 3D Mesh. Chủ động filter lược bỏ để chỉ nạp Detection + Recognition giúp rút ngắn **~40% thời gian** khởi động ứng dụng ban đầu.
-
----
-
-## 5. Cải thiện Hiệu năng thực chiến (Performance Optimizations)
+## 6. Cải thiện Hiệu năng thực chiến (Performance Optimizations)
 
 Đây là các khía cạnh tốn chi phí rực rỡ nhất để đưa dự án từ chỗ "Swap chờ gãy cổ" thành "Swap Real-time mượt".
 
@@ -115,7 +196,7 @@ Hệ thống kết hợp nhiều model nhẹ chạy **hoàn toàn offline/local*
 
 ---
 
-## 6. Bài học kinh nghiệm Đắt giá (Key Takeaways)
+## 7. Bài học kinh nghiệm Đắt giá (Key Takeaways)
 
 1. **Hiểu rõ giới hạn Tầng ảo hóa (Virtualized Environments):** Đừng vội vàng đổ lỗi do AI/Codebase khi dùng Docker mà thấy chậm. Rào cản truy cập phần cứng phân luồng cấp thấp (NPU/GPU/CoreML) từ bên trong Docker VM là vô cùng gian truân. Đối chiếu test Local là một quy trình bắt buộc trong ứng dụng AI thời gian thực.
 2. **Measure First, Optimize Later (Đo lường trước, Tối ưu sau):** Tránh Optimize bằng cảm tính. Thực thi việc cắm timing/Profiling cho 4 bước (Decode, Detect, Swap, Encode) đã dẫn lối thẳng đến bước Swap tốn lượng tài nguyên khổng lồ nhất (chiếm 80%) thay vì Detect.
@@ -124,7 +205,7 @@ Hệ thống kết hợp nhiều model nhẹ chạy **hoàn toàn offline/local*
 
 ---
 
-## 7. Setup System (TL;DR)
+## 8. Setup System (TL;DR)
 
 **Chạy Native trên hệ thống Local (Sử dụng CoreML - KHUYÊN DÙNG ĐỂ DEMO PERFORMANCE):**
 ```bash
@@ -134,19 +215,19 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Start Server
-uvicorn app.main:app --host 127.0.0.1 --port 7778 --reload
-# -> Truy cập: http://localhost:7778
+uvicorn app.main:app --host 127.0.0.1 --port 7777 --reload
+# -> Truy cập: http://localhost:7777
 ```
 
 **Chạy hệ thống cấp Container (Docker - Fallback CPU):**
 ```bash
 docker compose up --build -d
-# Cổng expose tại 7777 thay vì 7778
+# Cổng expose tại 7777 thay vì 7777
 ```
 
 ---
 
-## 8. Chrome Extension — Face Swap trên Google Meet
+## 9. Chrome Extension — Face Swap trên Google Meet
 
 Mở rộng demo từ bản web sang **Chrome Extension** cho phép swap face trực tiếp trong cuộc gọi Google Meet.
 
@@ -209,60 +290,41 @@ sequenceDiagram
 
 ---
 
-## 9. Context Pack cho Notebook LLM (Generate Slide)
+## 10. Context Pack cho Notebook LLM (Generate Slide)
 
-Đây là phần tóm tắt ngữ cảnh để model slide nắm đúng trọng tâm kỹ thuật, tránh tạo nội dung quá chung chung.
+### Problem Statement
+- Face swap real-time (webcam) + batch (MP4), chạy offline, bảo vệ dữ liệu khuôn mặt.
+- Trade-off chính: chất lượng ảnh vs FPS vs độ ổn định kết nối.
 
-### 9.1. Problem Statement
-1. Mục tiêu: Face swap real-time cho webcam và batch processing cho video MP4.
-2. Ràng buộc: Chạy local/offline, bảo vệ dữ liệu khuôn mặt, độ trễ thấp đủ dùng cho demo meeting.
-3. Thách thức chính: Trade-off giữa chất lượng hình, FPS và độ ổn định kết nối.
+### Slide Structure gợi ý
+1. Deepfake là gì — phân nhánh
+2. Cơ chế AI: 4 bước A→B (pipeline diagram)
+3. 3 Models: SCRFD / ArcFace / INSwapper
+4. Kiến trúc hệ thống: Real-time vs Batch
+5. Tối ưu hiệu năng (Docker vs CoreML, frame-skip, custom blend)
+6. Key Takeaways
+7. Demo + Roadmap
 
-### 9.2. Core Decisions
-1. Chọn ONNX Runtime + InsightFace để chạy đa nền tảng, giảm phụ thuộc training stack.
-2. Chọn WebSocket + backpressure cho real-time để tránh queue tích lũy latency.
-3. Chọn HTTP Polling + Background Task cho batch để tránh timeout.
-4. Chọn local native (CoreML provider) thay vì Docker khi demo hiệu năng trên Mac.
+### Benchmark Template (điền số trước khi generate slide)
 
-### 9.3. Performance Narrative (dùng cho storytelling slide)
-1. Trước tối ưu: pipeline bị nghẽn ở bước swap/blend, latency cao, FPS thấp.
-2. Sau tối ưu: giảm tác vụ dư, cache embedding, frame-skipping detection, cải thiện rõ latency/FPS.
-3. Bài học: đo lường từng stage (Decode, Detect, Swap, Encode) quan trọng hơn tối ưu cảm tính.
+| Scenario | Provider | Avg Latency (ms) | Avg FPS |
+|---|---|---:|---:|
+| Real-time — trước tối ưu | CPU (Docker) | TBD | TBD |
+| Real-time — sau tối ưu | CoreML (local) | TBD | TBD |
+| Batch MP4 | CoreML (local) | TBD (total job) | N/A |
 
-### 9.4. Failure Cases cần nêu trong slide
-1. Môi trường Docker VM không truy cập được ANE/GPU như local native.
-2. Mismatch color space hoặc aspect ratio gây giảm độ giống source face.
-3. Xử lý thiếu graceful cancel ở batch dễ gây treo worker và rò tài nguyên.
-
-### 9.5. Demo Script gợi ý (5-7 phút)
-1. Giới thiệu 2 luồng xử lý và lý do tách kiến trúc.
-2. Chạy real-time demo, hiển thị metrics panel.
-3. Chạy batch demo với progress + cancel.
-4. So sánh nhanh local native và Docker CPU fallback.
-5. Kết bằng 4 bài học kinh nghiệm và roadmap.
-
-### 9.6. Roadmap đề xuất
-1. Thêm quality profile (Fast/Balanced/High Quality).
-2. Hỗ trợ adaptive resolution theo tải máy.
-3. Cải thiện temporal consistency giữa các frame để giảm nhấp nháy.
-4. Mở rộng extension cho nhiều nền tảng web meeting/chat một cách ổn định.
-
-### 9.7. Benchmark Template (điền số trước khi generate slide)
-
-| Scenario | Resolution | Provider | Avg Latency (ms) | Avg FPS | Note |
-|---|---|---|---:|---:|---|
-| Web Real-time (Before) | 480x360 | CPU | TBD | TBD | Baseline trước tối ưu |
-| Web Real-time (After) | 480x360 | CoreML | TBD | TBD | Sau cache + blend + backpressure |
-| Extension (Before) | 640x480 | CPU/CoreML | TBD | TBD | Chưa chuẩn hóa aspect ratio |
-| Extension (After) | 480x360 | CPU/CoreML | TBD | TBD | Đã chuẩn hóa input/output ratio |
-| Batch MP4 | Source video | CPU/CoreML | TBD | N/A | Đo tổng thời gian job |
+### Roadmap
+1. Quality profile (Fast / Balanced / High Quality)
+2. Temporal consistency để giảm nhấp nháy giữa frames
+3. Adaptive resolution theo tải máy
+4. Mở rộng extension đa nền tảng (Zalo, Messenger)
 
 ### 8.3. Cách cài đặt & sử dụng
 
 ```bash
 # 1. Chạy backend server (bắt buộc)
 source venv/bin/activate
-uvicorn app.main:app --host 127.0.0.1 --port 7778 --reload
+uvicorn app.main:app --host 127.0.0.1 --port 7777 --reload
 
 # 2. Load extension vào Chrome
 #    → chrome://extensions → Bật "Developer mode"

@@ -90,19 +90,21 @@ class FaceSwapper:
     @staticmethod
     def _make_blend_mask(size: int) -> np.ndarray:
         """
-        Tạo soft feathered mask cho face blending.
-        Mask = 1.0 ở center, fade ra 0.0 ở edges.
-        Pre-compute 1 lần, reuse mỗi frame (thay vì tính erosion+dilation+blur mỗi lần).
+        Flat-top feathered mask:
+        - 1.0 ở vùng trung tâm (toàn bộ khuôn mặt)
+        - Cosine fade về 0 chỉ ở phần rìa ngoài (outer margin)
+
+        Hann window không dùng được vì fade quá mạnh ngay từ 10-20px từ cạnh
+        → vùng trán/cằm/má chỉ còn 0.05-0.25 → swap gần như vô hình.
+        Flat-top giữ full opacity trên toàn bộ mặt, chỉ fade ở rìa.
         """
-        mask = np.ones((size, size), dtype=np.float32)
-        border = max(size // 20, 4)  # ~6px cho 128
-        mask[:border, :] = 0
-        mask[-border:, :] = 0
-        mask[:, :border] = 0
-        mask[:, -border:] = 0
-        k = size // 8  # ~16 cho 128
-        k = k if k % 2 == 1 else k + 1  # kernel phải lẻ
-        mask = cv2.GaussianBlur(mask, (k, k), k // 3)
+        fade = size // 5   # 25px cho 128 — vùng transition
+        w = np.ones(size, dtype=np.float32)
+        for i in range(fade):
+            val = 0.5 * (1.0 - np.cos(np.pi * i / fade))  # cosine 0→1
+            w[i] = val
+            w[size - 1 - i] = val
+        mask = np.outer(w, w)
         return mask
 
     def set_source_face(self, image_bytes: bytes) -> bool:
@@ -166,10 +168,13 @@ class FaceSwapper:
         bgr_fake = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:, :, ::-1]
 
         # 5. Warp swapped face + pre-computed mask back to full image coords
+        # INTER_LANCZOS4: upsample chất lượng cao hơn INTER_LINEAR khi 128→full-res
         IM = cv2.invertAffineTransform(M)
         h, w = img.shape[:2]
-        face_warped = cv2.warpAffine(bgr_fake, IM, (w, h), borderValue=0)
-        mask_warped = cv2.warpAffine(self._blend_mask_128, IM, (w, h), borderValue=0)
+        face_warped = cv2.warpAffine(bgr_fake, IM, (w, h),
+                                     flags=cv2.INTER_LANCZOS4, borderValue=0)
+        mask_warped = cv2.warpAffine(self._blend_mask_128, IM, (w, h),
+                                     flags=cv2.INTER_LINEAR, borderValue=0)
 
         # 6. ROI-only alpha blend — chỉ xử lý vùng chứa mặt, không cả ảnh
         rows = np.any(mask_warped > 0.01, axis=1)
